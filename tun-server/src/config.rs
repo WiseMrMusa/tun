@@ -104,6 +104,10 @@ pub struct ServerConfig {
     #[arg(long, env = "TUN_PROXY_TLS")]
     pub proxy_tls: bool,
 
+    /// Enable TLS on the control plane (WebSocket) port (requires cert-path and key-path)
+    #[arg(long, env = "TUN_CONTROL_TLS")]
+    pub control_tls: bool,
+
     /// Port for Prometheus metrics endpoint (disabled if not set)
     #[arg(long, env = "TUN_METRICS_PORT")]
     pub metrics_port: Option<u16>,
@@ -129,6 +133,42 @@ pub struct ServerConfig {
     /// If not set, uses default of 30 seconds
     #[arg(long, env = "TUN_SHUTDOWN_TIMEOUT")]
     pub shutdown_timeout: Option<u64>,
+
+    /// Port for the introspection API server
+    #[arg(long, env = "TUN_API_PORT")]
+    pub api_port: Option<u16>,
+
+    /// Enable the built-in WebUI dashboard
+    #[arg(long, env = "TUN_ENABLE_DASHBOARD")]
+    pub enable_dashboard: bool,
+
+    /// API authentication key (required for admin endpoints)
+    #[arg(long, env = "TUN_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// Enable strict request validation (XSS, SQL injection detection)
+    #[arg(long, env = "TUN_STRICT_VALIDATION")]
+    pub strict_validation: bool,
+
+    /// OTLP endpoint for distributed tracing (e.g., http://localhost:4317)
+    #[arg(long, env = "TUN_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
+
+    /// OTLP API key for authenticated endpoints
+    #[arg(long, env = "TUN_OTLP_API_KEY")]
+    pub otlp_api_key: Option<String>,
+
+    /// Path to per-subdomain ACL configuration file (YAML)
+    #[arg(long, env = "TUN_ACL_CONFIG_FILE")]
+    pub acl_config_file: Option<String>,
+
+    /// Hot reload interval for config files (in seconds, 0 to disable)
+    #[arg(long, env = "TUN_HOT_RELOAD_INTERVAL", default_value = "0")]
+    pub hot_reload_interval: u64,
+
+    /// Internal address for cluster communication
+    #[arg(long, env = "TUN_CLUSTER_INTERNAL_ADDR")]
+    pub cluster_internal_addr: Option<String>,
 }
 
 impl ServerConfig {

@@ -9,6 +9,7 @@ mod config;
 mod dashboard;
 mod db;
 mod grpc;
+mod hotreload;
 mod ipfilter;
 mod limits;
 mod metrics;
@@ -24,15 +25,22 @@ mod tunnel;
 mod validation;
 mod websocket;
 
+use acl::AclManager;
 use anyhow::Result;
+use api::ApiState;
 use clap::Parser;
 use config::ServerConfig;
 use db::{DbConfig, TunnelDb};
+use ipfilter::{IpFilter, IpFilterConfig};
+use limits::{BodyLimitConfig, BodyLimiter};
 use ratelimit::{create_shared_limiter, RateLimitConfig};
 use shutdown::GracefulShutdown;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+use transform::TransformConfig;
+use validation::RequestValidator;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -163,6 +171,51 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Start the API and dashboard server if configured
+    let api_handle = if let Some(api_port) = config.api_port {
+        let api_state = ApiState {
+            registry: state.clone(),
+            rate_limiter: rate_limiter.clone(),
+            start_time: Instant::now(),
+            api_key: config.api_key.clone(),
+        };
+
+        if config.api_key.is_some() {
+            info!("API authentication enabled (admin endpoints require API key)");
+        } else {
+            warn!("API authentication disabled - admin endpoints are unprotected!");
+        }
+
+        let api_router = if config.enable_dashboard {
+            info!("Dashboard enabled at http://0.0.0.0:{}/", api_port);
+            api::create_api_router(api_state).merge(dashboard::dashboard_router())
+        } else {
+            api::create_api_router(api_state)
+        };
+
+        let api_addr = format!("0.0.0.0:{}", api_port);
+        info!("API server listening on {}", api_addr);
+
+        Some(tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(&api_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind API server: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = axum::serve(listener, api_router).await {
+                tracing::error!("API server error: {}", e);
+            }
+        }))
+    } else {
+        if config.enable_dashboard {
+            warn!("Dashboard enabled but TUN_API_PORT not set - dashboard will not be available");
+        }
+        info!("API server disabled (set TUN_API_PORT to enable)");
+        None
+    };
+
     info!("Server is ready to accept connections");
 
     // Setup graceful shutdown with configurable timeout
@@ -202,6 +255,9 @@ async fn main() -> Result<()> {
     control_handle.abort();
     proxy_handle.abort();
     if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
+    if let Some(handle) = api_handle {
         handle.abort();
     }
 
