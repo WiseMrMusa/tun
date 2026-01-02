@@ -123,14 +123,33 @@ pub fn record_server_start() {
 }
 
 /// Record a WebSocket connection.
-pub fn record_websocket_connected() {
-    counter!("tun_websocket_connections_total").increment(1);
+pub fn record_websocket_connected(tunnel_id: &str, subdomain: &str) {
+    counter!("tun_websocket_connections_total",
+        "tunnel" => tunnel_id.to_string(),
+        "subdomain" => subdomain.to_string()
+    ).increment(1);
     gauge!("tun_active_websocket_connections").increment(1.0);
 }
 
 /// Record a WebSocket disconnection.
-pub fn record_websocket_disconnected() {
+pub fn record_websocket_disconnected(tunnel_id: &str) {
     gauge!("tun_active_websocket_connections").decrement(1.0);
+}
+
+/// Record an ACL denial.
+pub fn record_acl_denied(subdomain: &str, reason: &str) {
+    counter!("tun_acl_denied_total",
+        "subdomain" => subdomain.to_string(),
+        "reason" => reason.to_string()
+    ).increment(1);
+}
+
+/// Record a validation failure.
+pub fn record_validation_failure(subdomain: &str, reason: &str) {
+    counter!("tun_validation_failure_total",
+        "subdomain" => subdomain.to_string(),
+        "reason" => reason.to_string()
+    ).increment(1);
 }
 
 /// Record WebSocket frames.
@@ -205,6 +224,95 @@ pub fn record_validation_rejected(reason: &str) {
     counter!("tun_validation_rejected_total",
         "reason" => reason.to_string()
     ).increment(1);
+}
+
+// === Connection Metadata Tracking ===
+
+/// Record connection with timestamp and metadata.
+pub fn record_connection_metadata(tunnel_id: &str, client_ip: &str, subdomain: &str) {
+    counter!("tun_connection_events_total",
+        "tunnel" => tunnel_id.to_string(),
+        "subdomain" => subdomain.to_string(),
+        "event" => "connect"
+    ).increment(1);
+    
+    // Track by client IP for geographic analysis
+    counter!("tun_connections_by_ip_total",
+        "client_ip_prefix" => truncate_ip(client_ip)
+    ).increment(1);
+}
+
+/// Record disconnection with duration.
+pub fn record_disconnection_metadata(tunnel_id: &str, duration_secs: f64) {
+    counter!("tun_connection_events_total",
+        "tunnel" => tunnel_id.to_string(),
+        "event" => "disconnect"
+    ).increment(1);
+    
+    histogram!("tun_connection_duration_seconds",
+        "tunnel" => tunnel_id.to_string()
+    ).record(duration_secs);
+}
+
+// === Cluster Metrics ===
+
+/// Record cluster peer count.
+pub fn set_cluster_peer_count(count: usize) {
+    gauge!("tun_cluster_peers_total").set(count as f64);
+}
+
+/// Record cluster peer health.
+pub fn set_cluster_healthy_peers(count: usize) {
+    gauge!("tun_cluster_healthy_peers").set(count as f64);
+}
+
+/// Record cross-server request forwarding.
+pub fn record_cluster_forward(target_server: &str, success: bool) {
+    counter!("tun_cluster_forwards_total",
+        "target" => target_server.to_string(),
+        "success" => success.to_string()
+    ).increment(1);
+}
+
+/// Record peer heartbeat.
+pub fn record_peer_heartbeat(server_id: &str) {
+    counter!("tun_peer_heartbeats_total",
+        "server" => server_id.to_string()
+    ).increment(1);
+}
+
+// === OTLP Export Metrics ===
+
+/// Record OTLP span export.
+pub fn record_otlp_export(span_count: usize, success: bool) {
+    counter!("tun_otlp_spans_exported_total",
+        "success" => success.to_string()
+    ).increment(span_count as u64);
+}
+
+/// Record OTLP export latency.
+pub fn record_otlp_export_latency(duration_ms: f64) {
+    histogram!("tun_otlp_export_duration_ms").record(duration_ms);
+}
+
+// === Hot Reload Metrics ===
+
+/// Record config reload.
+pub fn record_config_reload(config_type: &str, success: bool) {
+    counter!("tun_config_reloads_total",
+        "type" => config_type.to_string(),
+        "success" => success.to_string()
+    ).increment(1);
+}
+
+/// Helper to truncate IP for privacy (keeping first two octets for IPv4).
+fn truncate_ip(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}.*.*", parts[0], parts[1])
+    } else {
+        "*".to_string()
+    }
 }
 
 /// Create a metrics router that serves the /metrics endpoint.
