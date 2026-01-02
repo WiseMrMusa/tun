@@ -9,7 +9,7 @@ pub mod multiplex;
 pub mod protocol;
 
 pub use auth::{AuthError, AuthToken, TokenValidator, DEFAULT_TOKEN_TTL_SECONDS};
-pub use error::{ErrorCategory, ResultExt, TunnelError, TunnelResult};
+pub use error::{TunnelError, TunnelResult};
 pub use protocol::{
     HttpMethod, HttpRequestData, HttpResponseData, Message, MessageType, Payload, RequestId,
     StreamChunkData, TunnelId, WebSocketFrameData, WebSocketOpcode,
