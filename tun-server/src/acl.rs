@@ -299,6 +299,53 @@ impl AclManager {
             now.duration_since(v.last_update) < max_age
         });
     }
+
+    /// Clear all rules (for hot reload).
+    pub fn clear_rules(&mut self) {
+        self.rules.clear();
+        self.rate_limiters.clear();
+        self.connection_counts.clear();
+        info!("Cleared all ACL rules");
+    }
+
+    /// Add a subdomain rule from config (for hot reload).
+    pub fn add_subdomain_rule(&mut self, subdomain: &str, config: SubdomainAclConfig) {
+        let mut acl = SubdomainAcl::new(subdomain);
+        acl.enabled = config.enabled;
+        
+        // Parse IP allowlist
+        for ip_str in config.ip_allowlist {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                acl.allowed_ips.insert(ip);
+            }
+        }
+        
+        // Parse IP blocklist
+        for ip_str in config.ip_blocklist {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                acl.blocked_ips.insert(ip);
+            }
+        }
+        
+        acl.rate_limit_rps = config.rate_limit_rps;
+        acl.rate_limit_burst = config.rate_limit_burst;
+        acl.max_connections = config.max_connections.map(|n| n as u32);
+        acl.max_body_size = config.max_body_size;
+        
+        self.add_rule(acl);
+    }
+}
+
+/// Configuration for subdomain ACL from external config file.
+#[derive(Debug, Clone, Default)]
+pub struct SubdomainAclConfig {
+    pub enabled: bool,
+    pub ip_allowlist: Vec<String>,
+    pub ip_blocklist: Vec<String>,
+    pub rate_limit_rps: Option<u32>,
+    pub rate_limit_burst: Option<u32>,
+    pub max_connections: Option<usize>,
+    pub max_body_size: Option<usize>,
 }
 
 impl Default for AclManager {

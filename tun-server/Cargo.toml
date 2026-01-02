@@ -79,3 +79,7 @@ ipnet = { workspace = true }
 lru = { workspace = true }
 regex = { workspace = true }
 
+# Hot Reload
+notify = "6.1"
+serde_yaml = "0.9"
+
