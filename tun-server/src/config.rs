@@ -2,6 +2,21 @@
 
 use clap::Parser;
 
+/// Default body size limit: 100MB
+pub const DEFAULT_BODY_SIZE_LIMIT: usize = 100 * 1024 * 1024;
+
+/// Default authentication timeout: 10 seconds
+pub const DEFAULT_AUTH_TIMEOUT: u64 = 10;
+
+/// Default request timeout: 30 seconds
+pub const DEFAULT_REQUEST_TIMEOUT: u64 = 30;
+
+/// Default rate limit: requests per second per IP
+pub const DEFAULT_RATE_LIMIT_RPS: u32 = 100;
+
+/// Default rate limit burst size
+pub const DEFAULT_RATE_LIMIT_BURST: u32 = 200;
+
 /// Tun Server - Securely expose local ports to the internet.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "tun-server")]
@@ -40,6 +55,48 @@ pub struct ServerConfig {
     #[arg(long, env = "TUN_REQUEST_TIMEOUT", default_value = "30")]
     pub request_timeout: u64,
 
+    /// Token time-to-live in seconds (default: 7 days)
+    #[arg(long, env = "TUN_TOKEN_TTL", default_value = "604800")]
+    pub token_ttl: u64,
+
+    /// Maximum request body size in bytes (default: 100MB)
+    #[arg(long, env = "TUN_BODY_SIZE_LIMIT", default_value = "104857600")]
+    pub body_size_limit: usize,
+
+    /// Authentication timeout in seconds
+    #[arg(long, env = "TUN_AUTH_TIMEOUT", default_value = "10")]
+    pub auth_timeout: u64,
+
+    /// Rate limit: requests per second per IP
+    #[arg(long, env = "TUN_RATE_LIMIT_RPS", default_value = "100")]
+    pub rate_limit_rps: u32,
+
+    /// Rate limit burst size
+    #[arg(long, env = "TUN_RATE_LIMIT_BURST", default_value = "200")]
+    pub rate_limit_burst: u32,
+
+    /// PostgreSQL database URL for persistence (optional)
+    /// If not provided, tunnel state is stored in memory only
+    #[arg(long, env = "TUN_DATABASE_URL")]
+    pub database_url: Option<String>,
+
+    /// Server ID for horizontal scaling (auto-generated if not provided)
+    #[arg(long, env = "TUN_SERVER_ID")]
+    pub server_id: Option<String>,
+
+    /// Enable TLS on the HTTP proxy port (requires cert-path and key-path)
+    #[arg(long, env = "TUN_PROXY_TLS")]
+    pub proxy_tls: bool,
+
+    /// Port for Prometheus metrics endpoint (disabled if not set)
+    #[arg(long, env = "TUN_METRICS_PORT")]
+    pub metrics_port: Option<u16>,
+
+    /// Enable single-port mode (control and proxy on same port)
+    /// When enabled, /ws routes to control plane, all other paths to proxy
+    #[arg(long, env = "TUN_SINGLE_PORT")]
+    pub single_port: bool,
+
     /// Enable debug logging
     #[arg(long, env = "TUN_DEBUG")]
     pub debug: bool,
@@ -48,11 +105,28 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Get the base URL for tunnels.
     pub fn tunnel_base_url(&self, subdomain: &str) -> String {
-        if self.cert_path.is_some() {
+        if self.cert_path.is_some() || self.proxy_tls {
             format!("https://{}.{}", subdomain, self.domain)
         } else {
             format!("http://{}.{}:{}", subdomain, self.domain, self.http_port)
         }
+    }
+
+    /// Get or generate the server ID.
+    pub fn get_server_id(&self) -> String {
+        self.server_id.clone().unwrap_or_else(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            
+            let hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            
+            let mut hasher = DefaultHasher::new();
+            hostname.hash(&mut hasher);
+            std::process::id().hash(&mut hasher);
+            format!("srv-{:016x}", hasher.finish())
+        })
     }
 }
 

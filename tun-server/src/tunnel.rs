@@ -1,11 +1,13 @@
 //! Tunnel management and WebSocket control server.
 
 use crate::config::ServerConfig;
+use crate::db::TunnelDb;
+use crate::ratelimit::{IpRateLimiter, RateLimitLayer};
 use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::IntoResponse,
     routing::get,
@@ -13,6 +15,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -36,15 +39,33 @@ pub struct TunnelConnection {
     pub tx: mpsc::Sender<Message>,
     /// Pending HTTP requests waiting for responses
     pub pending_requests: DashMap<RequestId, PendingRequest>,
+    /// Request timeout in seconds
+    pub request_timeout: u64,
 }
 
 impl TunnelConnection {
-    pub fn new(id: TunnelId, tx: mpsc::Sender<Message>) -> Self {
+    pub fn new(id: TunnelId, tx: mpsc::Sender<Message>, request_timeout: u64) -> Self {
         Self {
             subdomain: id.subdomain(),
             id,
             tx,
             pending_requests: DashMap::new(),
+            request_timeout,
+        }
+    }
+
+    pub fn new_with_subdomain(
+        id: TunnelId,
+        subdomain: String,
+        tx: mpsc::Sender<Message>,
+        request_timeout: u64,
+    ) -> Self {
+        Self {
+            subdomain,
+            id,
+            tx,
+            pending_requests: DashMap::new(),
+            request_timeout,
         }
     }
 
@@ -59,13 +80,13 @@ impl TunnelConnection {
 
         self.tx.send(msg).await?;
 
-        // Wait for response with timeout
+        // Wait for response with configurable timeout
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(self.request_timeout),
             response_rx,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Request timeout"))??;
+        .map_err(|_| anyhow::anyhow!("Request timeout ({}s)", self.request_timeout))??;
 
         Ok(response)
     }
@@ -90,11 +111,13 @@ pub struct TunnelRegistry {
     pub config: ServerConfig,
     /// Token validator
     pub token_validator: TokenValidator,
+    /// Optional database for persistence
+    pub db: Option<Arc<TunnelDb>>,
 }
 
 impl TunnelRegistry {
-    pub fn new(config: ServerConfig) -> Self {
-        let token_validator = if let Some(ref secret) = config.auth_secret {
+    pub fn new(config: ServerConfig, db: Option<Arc<TunnelDb>>) -> Self {
+        let mut token_validator = if let Some(ref secret) = config.auth_secret {
             TokenValidator::from_hex(secret).unwrap_or_else(|_| {
                 warn!("Invalid auth secret, generating new one");
                 TokenValidator::default()
@@ -105,31 +128,59 @@ impl TunnelRegistry {
             info!("Use this secret to generate client tokens");
             validator
         };
+        
+        // Configure token TTL from config
+        token_validator.set_ttl(config.token_ttl);
+        info!("Token TTL: {} seconds ({} days)", config.token_ttl, config.token_ttl / 86400);
 
         Self {
             tunnels_by_subdomain: DashMap::new(),
             tunnels_by_id: DashMap::new(),
             config,
             token_validator,
+            db,
         }
     }
 
     /// Register a new tunnel.
-    pub fn register(&self, tunnel: Arc<TunnelConnection>) {
+    pub async fn register(
+        &self,
+        tunnel: Arc<TunnelConnection>,
+        token_id: &str,
+        client_ip: Option<&str>,
+    ) {
         info!(
             "Registering tunnel {} with subdomain {}",
             tunnel.id, tunnel.subdomain
         );
+        
+        // Persist to database if available
+        if let Some(ref db) = self.db {
+            if let Err(e) = db
+                .register_tunnel(tunnel.id, &tunnel.subdomain, token_id, client_ip)
+                .await
+            {
+                warn!("Failed to persist tunnel to database: {}", e);
+            }
+        }
+        
         self.tunnels_by_subdomain
             .insert(tunnel.subdomain.clone(), tunnel.clone());
         self.tunnels_by_id.insert(tunnel.id, tunnel);
     }
 
     /// Unregister a tunnel.
-    pub fn unregister(&self, tunnel_id: TunnelId) {
+    pub async fn unregister(&self, tunnel_id: TunnelId) {
         if let Some((_, tunnel)) = self.tunnels_by_id.remove(&tunnel_id) {
             info!("Unregistering tunnel {}", tunnel_id);
             self.tunnels_by_subdomain.remove(&tunnel.subdomain);
+            
+            // Update database if available
+            if let Some(ref db) = self.db {
+                if let Err(e) = db.unregister_tunnel(tunnel_id).await {
+                    warn!("Failed to update tunnel in database: {}", e);
+                }
+            }
         }
     }
 
@@ -147,19 +198,48 @@ impl TunnelRegistry {
     pub fn can_accept(&self) -> bool {
         self.count() < self.config.max_tunnels
     }
+
+    /// Check if a subdomain is available.
+    pub async fn is_subdomain_available(&self, subdomain: &str) -> bool {
+        // Check in-memory first
+        if self.tunnels_by_subdomain.contains_key(subdomain) {
+            return false;
+        }
+        
+        // Check database if available
+        if let Some(ref db) = self.db {
+            match db.is_subdomain_available(subdomain).await {
+                Ok(available) => return available,
+                Err(e) => {
+                    warn!("Failed to check subdomain availability in database: {}", e);
+                }
+            }
+        }
+        
+        true
+    }
 }
 
 /// Run the control server for tunnel client connections.
-pub async fn run_control_server(addr: &str, registry: Arc<TunnelRegistry>) -> Result<()> {
+pub async fn run_control_server(
+    addr: &str,
+    registry: Arc<TunnelRegistry>,
+    rate_limiter: Arc<IpRateLimiter>,
+) -> Result<()> {
     let app = Router::new()
         .route("/ws", get(websocket_handler))
         .route("/health", get(health_handler))
+        .layer(RateLimitLayer::from_limiter(rate_limiter))
         .with_state(registry);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Control server listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -167,14 +247,30 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
+/// Internal function for handling tunnel connections.
+/// Exposed for use by the multiplex module.
+pub async fn handle_tunnel_connection_internal(
+    socket: WebSocket,
+    registry: Arc<TunnelRegistry>,
+    client_ip: String,
+) {
+    handle_tunnel_connection(socket, registry, client_ip).await
+}
+
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(registry): State<Arc<TunnelRegistry>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_tunnel_connection(socket, registry))
+    let client_ip = addr.ip().to_string();
+    ws.on_upgrade(move |socket| handle_tunnel_connection(socket, registry, client_ip))
 }
 
-async fn handle_tunnel_connection(socket: WebSocket, registry: Arc<TunnelRegistry>) {
+async fn handle_tunnel_connection(
+    socket: WebSocket,
+    registry: Arc<TunnelRegistry>,
+    client_ip: String,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Channel for sending messages to the WebSocket
@@ -183,8 +279,8 @@ async fn handle_tunnel_connection(socket: WebSocket, registry: Arc<TunnelRegistr
     // Wait for authentication
     let auth_result = authenticate_client(&mut ws_rx, &registry).await;
 
-    let tunnel_id = match auth_result {
-        Ok(tunnel_id) => tunnel_id,
+    let (tunnel_id, token_id, subdomain) = match auth_result {
+        Ok(result) => result,
         Err(e) => {
             error!("Authentication failed: {}", e);
             let error_msg = Message::error(401, e.to_string());
@@ -204,21 +300,34 @@ async fn handle_tunnel_connection(socket: WebSocket, registry: Arc<TunnelRegistr
         return;
     }
 
-    // Create and register the tunnel
-    let tunnel = Arc::new(TunnelConnection::new(tunnel_id, tx));
-    registry.register(tunnel.clone());
+    // Create and register the tunnel with custom subdomain
+    let tunnel = Arc::new(TunnelConnection::new_with_subdomain(
+        tunnel_id,
+        subdomain.clone(),
+        tx,
+        registry.config.request_timeout,
+    ));
+    registry
+        .register(tunnel.clone(), &token_id, Some(&client_ip))
+        .await;
 
-    // Send connected message
-    let connected_msg = Message::connected(tunnel_id);
+    // Send connected message with the actual subdomain
+    let connected_msg = Message::new(
+        MessageType::Connected,
+        Payload::Connected {
+            tunnel_id,
+            subdomain: subdomain.clone(),
+        },
+    );
     if let Ok(bytes) = connected_msg.to_bytes() {
         if let Err(e) = ws_tx.send(WsMessage::Binary(bytes.to_vec())).await {
             error!("Failed to send connected message: {}", e);
-            registry.unregister(tunnel_id);
+            registry.unregister(tunnel_id).await;
             return;
         }
     }
 
-    let subdomain = tunnel.subdomain.clone();
+    // subdomain is already extracted from auth result
     let url = registry.config.tunnel_base_url(&subdomain);
     info!("Tunnel {} connected: {}", tunnel_id, url);
 
@@ -264,16 +373,19 @@ async fn handle_tunnel_connection(socket: WebSocket, registry: Arc<TunnelRegistr
 
     // Cleanup
     tx_task.abort();
-    registry.unregister(tunnel_id);
+    registry.unregister(tunnel_id).await;
     info!("Tunnel {} disconnected", tunnel_id);
 }
+
+/// Result of successful authentication: (TunnelId, token_id, subdomain)
+type AuthResult = (TunnelId, String, String);
 
 async fn authenticate_client(
     ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
     registry: &TunnelRegistry,
-) -> Result<TunnelId> {
-    // Wait for auth message with timeout
-    let auth_timeout = std::time::Duration::from_secs(10);
+) -> Result<AuthResult> {
+    // Wait for auth message with configurable timeout
+    let auth_timeout = std::time::Duration::from_secs(registry.config.auth_timeout);
 
     let msg = tokio::time::timeout(auth_timeout, ws_rx.next())
         .await
@@ -290,12 +402,39 @@ async fn authenticate_client(
 
     match message.msg_type {
         MessageType::Auth => {
-            if let Payload::Auth { token } = message.payload {
-                registry
+            if let Payload::Auth { token, requested_subdomain } = message.payload {
+                let auth_token = registry
                     .token_validator
-                    .validate(&token)
+                    .validate_with_expiry(&token)
                     .map_err(|e| anyhow::anyhow!("Invalid token: {}", e))?;
-                Ok(TunnelId::new())
+                
+                // Generate or use requested subdomain
+                let tunnel_id = TunnelId::new();
+                let subdomain = if let Some(requested) = requested_subdomain {
+                    // Validate the requested subdomain
+                    if !is_valid_subdomain(&requested) {
+                        return Err(anyhow::anyhow!(
+                            "Invalid subdomain '{}': must be alphanumeric with optional hyphens, 3-32 characters",
+                            requested
+                        ));
+                    }
+                    
+                    // Check if subdomain is available
+                    if !registry.is_subdomain_available(&requested).await {
+                        return Err(anyhow::anyhow!(
+                            "Subdomain '{}' is already in use or reserved",
+                            requested
+                        ));
+                    }
+                    
+                    info!("Custom subdomain '{}' requested and approved", requested);
+                    requested
+                } else {
+                    // Use auto-generated subdomain from tunnel ID
+                    tunnel_id.subdomain()
+                };
+                
+                Ok((tunnel_id, auth_token.id, subdomain))
             } else {
                 Err(anyhow::anyhow!("Invalid auth payload"))
             }
@@ -304,12 +443,33 @@ async fn authenticate_client(
     }
 }
 
+/// Validate a subdomain format.
+fn is_valid_subdomain(subdomain: &str) -> bool {
+    // Must be 3-32 characters, alphanumeric with optional hyphens
+    // Cannot start or end with hyphen
+    if subdomain.len() < 3 || subdomain.len() > 32 {
+        return false;
+    }
+    
+    if subdomain.starts_with('-') || subdomain.ends_with('-') {
+        return false;
+    }
+    
+    subdomain.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 async fn handle_client_message(tunnel: &TunnelConnection, msg: Message) {
     match msg.msg_type {
         MessageType::Pong => {
             debug!("Pong from tunnel {}", tunnel.id);
         }
-        MessageType::HttpResponse => {
+        MessageType::HttpResponse
+        | MessageType::WebSocketUpgradeResponse
+        | MessageType::TcpData
+        | MessageType::WebSocketFrame
+        | MessageType::StreamChunk
+        | MessageType::StreamEnd => {
+            // All response types are handled the same way - route to pending request
             tunnel.handle_response(msg);
         }
         MessageType::Close => {

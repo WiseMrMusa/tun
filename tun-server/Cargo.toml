@@ -28,6 +28,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+http-body-util = { workspace = true }
 
 # TLS
 rustls = { workspace = true }
@@ -45,10 +46,24 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Database
+sqlx = { workspace = true }
+chrono = { workspace = true }
+
+# Rate Limiting
+governor = { workspace = true }
+tower_governor = { workspace = true }
+
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
 # Utilities
 uuid = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+hostname = "0.4"
+pin-project-lite = { workspace = true }
 
