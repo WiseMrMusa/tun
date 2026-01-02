@@ -1,0 +1,40 @@
+[package]
+name = "tun-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Client component for the tun tunneling service"
+
+[[bin]]
+name = "tun-client"
+path = "src/main.rs"
+
+[dependencies]
+tun-core = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+# TLS
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+
