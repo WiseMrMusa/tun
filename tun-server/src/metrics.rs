@@ -274,6 +274,27 @@ pub fn record_cluster_forward(target_server: &str, success: bool) {
     ).increment(1);
 }
 
+/// Record circuit breaker trip.
+pub fn record_circuit_breaker_trip(tunnel_id: &str) {
+    counter!("tun_circuit_breaker_trips_total",
+        "tunnel" => tunnel_id.to_string()
+    ).increment(1);
+}
+
+/// Record circuit breaker state.
+pub fn set_circuit_breaker_state(tunnel_id: &str, state: &str) {
+    // Use gauge to track current state (0=closed, 1=open, 2=half-open)
+    let value = match state {
+        "closed" => 0.0,
+        "open" => 1.0,
+        "half_open" => 2.0,
+        _ => 0.0,
+    };
+    gauge!("tun_circuit_breaker_state",
+        "tunnel" => tunnel_id.to_string()
+    ).set(value);
+}
+
 /// Record peer heartbeat.
 pub fn record_peer_heartbeat(server_id: &str) {
     counter!("tun_peer_heartbeats_total",
