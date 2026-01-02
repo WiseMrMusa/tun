@@ -4,6 +4,7 @@
 //! Also supports WebSocket frame forwarding.
 
 use crate::config::ClientConfig;
+use crate::pool::{ConnectionPool, PoolConfig};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -13,6 +14,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -97,9 +99,21 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
     // Connect to the tunnel server
     let (ws_stream, _) = ws_connect_async(&url).await?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
-    
+
     // WebSocket session manager for frame forwarding
     let ws_sessions = Arc::new(WebSocketSessions::new());
+    
+    // Initialize connection pool for local service connections
+    let pool_config = PoolConfig {
+        max_connections: 32,
+        idle_timeout: Duration::from_secs(60),
+        acquire_timeout: Duration::from_secs(30),
+        max_lifetime: Duration::from_secs(300),
+    };
+    let connection_pool = ConnectionPool::new(pool_config);
+    
+    // Start background pool cleanup task
+    let cleanup_handle = connection_pool.start_cleanup_task(Duration::from_secs(30));
 
     // Authenticate (with optional custom subdomain)
     let auth_msg = match &config.subdomain {
@@ -197,8 +211,9 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
                         let response_tx = response_tx.clone();
                         let config = config.clone();
                         let ws_sessions = ws_sessions.clone();
+                        let pool = connection_pool.clone();
                         tokio::spawn(async move {
-                            handle_server_message(msg, &config, response_tx, ws_sessions).await;
+                            handle_server_message(msg, &config, response_tx, ws_sessions, pool).await;
                         });
                     }
                     Err(e) => {
@@ -224,6 +239,16 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
     // Cleanup
     heartbeat_handle.abort();
     send_handle.abort();
+    cleanup_handle.abort();
+    
+    // Log pool stats at disconnect
+    let stats = connection_pool.stats();
+    info!(
+        "Connection pool stats: total={}, reused={}, reuse_ratio={:.1}%",
+        stats.total_connections,
+        stats.reused_connections,
+        stats.reuse_ratio() * 100.0
+    );
 
     Ok(())
 }
@@ -233,6 +258,7 @@ async fn handle_server_message(
     config: &crate::config::ClientConfig,
     response_tx: tokio::sync::mpsc::Sender<Message>,
     ws_sessions: Arc<WebSocketSessions>,
+    pool: Arc<ConnectionPool>,
 ) {
     match msg.msg_type {
         MessageType::HttpRequest => {
@@ -241,7 +267,7 @@ async fn handle_server_message(
             if let Payload::HttpRequest(request_data) = msg.payload {
                 // Route to the appropriate local port based on path
                 let local_addr = config.local_addr_for_path(&request_data.uri);
-                let response = forward_http_request(&local_addr, request_data).await;
+                let response = forward_http_request(&local_addr, request_data, &pool).await;
                 let response_msg = Message::http_response(request_id, response);
 
                 if response_tx.send(response_msg).await.is_err() {
@@ -512,7 +538,11 @@ async fn forward_tcp_data(local_addr: &str, data: &[u8]) -> Result<Vec<u8>> {
     Ok(response)
 }
 
-async fn forward_http_request(local_addr: &str, request: HttpRequestData) -> HttpResponseData {
+async fn forward_http_request(
+    local_addr: &str,
+    request: HttpRequestData,
+    pool: &Arc<ConnectionPool>,
+) -> HttpResponseData {
     debug!(
         "Forwarding {} {} {} to {}",
         request.version, request.method, request.uri, local_addr
@@ -521,7 +551,7 @@ async fn forward_http_request(local_addr: &str, request: HttpRequestData) -> Htt
     // Choose HTTP version based on request
     let result = match request.version {
         HttpVersion::H2 => forward_with_http2(local_addr, &request).await,
-        _ => forward_with_http1(local_addr, &request).await,
+        _ => forward_with_http1_pooled(local_addr, &request, pool).await,
     };
 
     match result {
@@ -539,6 +569,7 @@ async fn forward_http_request(local_addr: &str, request: HttpRequestData) -> Htt
 }
 
 /// Forward an HTTP/1.1 request to the local service using hyper.
+#[allow(dead_code)]
 async fn forward_with_http1(
     local_addr: &str,
     request_data: &HttpRequestData,
@@ -554,6 +585,43 @@ async fn forward_with_http1(
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             debug!("HTTP/1.1 connection error: {}", e);
+        }
+    });
+
+    // Build request
+    let req = build_hyper_request(request_data, local_addr)?;
+
+    // Send request
+    let response = sender.send_request(req).await?;
+
+    // Convert response
+    convert_hyper_response(response, HttpVersion::Http11).await
+}
+
+/// Forward an HTTP/1.1 request to the local service using a pooled connection.
+async fn forward_with_http1_pooled(
+    local_addr: &str,
+    request_data: &HttpRequestData,
+    pool: &Arc<ConnectionPool>,
+) -> Result<HttpResponseData> {
+    // Get connection from pool (creates new if needed)
+    let mut pooled_conn = pool.get(local_addr).await?;
+    
+    // Take the stream from the pooled connection
+    // Note: We take ownership because hyper needs exclusive access
+    let stream = pooled_conn
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get stream from pool"))?;
+    
+    let io = TokioIo::new(stream);
+
+    // Create HTTP/1 connection
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+
+    // Spawn connection driver
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("HTTP/1.1 pooled connection error: {}", e);
         }
     });
 
