@@ -4,6 +4,7 @@ use crate::config::ServerConfig;
 use crate::db::TunnelDb;
 use crate::metrics;
 use crate::ratelimit::{IpRateLimiter, RateLimitLayer};
+use crate::tls;
 use crate::websocket::WebSocketManager;
 use anyhow::Result;
 use axum::{
@@ -20,6 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 use tun_core::{
     auth::TokenValidator,
@@ -268,20 +270,52 @@ impl TunnelRegistry {
     }
 }
 
+/// TLS configuration for the control server.
+#[derive(Clone)]
+pub struct ControlTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
 /// Run the control server for tunnel client connections.
 pub async fn run_control_server(
     addr: &str,
     registry: Arc<TunnelRegistry>,
     rate_limiter: Arc<IpRateLimiter>,
 ) -> Result<()> {
+    // Check if TLS is configured for the control plane
+    let tls_config = if registry.config.control_tls {
+        match (&registry.config.cert_path, &registry.config.key_path) {
+            (Some(cert), Some(key)) => Some(ControlTlsConfig {
+                cert_path: cert.clone(),
+                key_path: key.clone(),
+            }),
+            _ => {
+                warn!("control_tls enabled but cert_path or key_path not provided, falling back to plain WebSocket");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let app = Router::new()
         .route("/ws", get(websocket_handler))
         .route("/health", get(health_handler))
         .layer(RateLimitLayer::from_limiter(rate_limiter))
         .with_state(registry);
 
+    if let Some(tls_cfg) = tls_config {
+        run_control_server_tls(addr, app, tls_cfg).await
+    } else {
+        run_control_server_plain(addr, app).await
+    }
+}
+
+/// Run the control server without TLS.
+async fn run_control_server_plain(addr: &str, app: Router) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Control server listening on {}", addr);
+    info!("Control server listening on {} (plain WebSocket)", addr);
 
     axum::serve(
         listener,
@@ -289,6 +323,76 @@ pub async fn run_control_server(
     )
     .await?;
     Ok(())
+}
+
+/// Run the control server with TLS.
+async fn run_control_server_tls(
+    addr: &str,
+    app: Router,
+    tls_config: ControlTlsConfig,
+) -> Result<()> {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+    use std::convert::Infallible;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    // Load TLS configuration
+    let rustls_config = tls::load_tls_config(&tls_config.cert_path, &tls_config.key_path)?;
+    let tls_acceptor = TlsAcceptor::from(rustls_config);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("Control server listening on {} (TLS enabled)", addr);
+
+    loop {
+        let (tcp_stream, remote_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!("Failed to accept connection: {}", e);
+                continue;
+            }
+        };
+
+        let tls_acceptor = tls_acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            // Perform TLS handshake
+            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    debug!("TLS handshake failed from {}: {}", remote_addr, e);
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(tls_stream);
+
+            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                // Convert hyper::Request to http::Request
+                let (parts, body) = req.into_parts();
+                let body = Body::new(body);
+                let req = Request::from_parts(parts, body);
+
+                let app = app.clone();
+                async move {
+                    let resp = app.oneshot(req).await.map_err(|e| {
+                        error!("Service error: {}", e);
+                        e
+                    })?;
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+
+            let builder = AutoBuilder::new(TokioExecutor::new());
+
+            if let Err(e) = builder.serve_connection(io, service).await {
+                debug!("Connection error from {}: {}", remote_addr, e);
+            }
+        });
+    }
 }
 
 async fn health_handler() -> &'static str {
@@ -459,6 +563,14 @@ async fn authenticate_client(
                     .token_validator
                     .validate_with_expiry(&token)
                     .map_err(|e| anyhow::anyhow!("Invalid token: {}", e))?;
+
+                // === Phase 2.1: Check if token is revoked ===
+                if let Some(ref db) = registry.db {
+                    if db.is_token_revoked(&auth_token.id).await? {
+                        warn!("Token {} has been revoked", auth_token.id);
+                        return Err(anyhow::anyhow!("Token has been revoked"));
+                    }
+                }
                 
                 // Generate or use requested subdomain
                 let tunnel_id = TunnelId::new();
