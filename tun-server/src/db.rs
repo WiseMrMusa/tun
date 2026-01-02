@@ -55,6 +55,8 @@ pub enum AuditEventType {
     AuthSuccess,
     AuthFailure,
     RateLimitExceeded,
+    TokenRevoked,
+    TokenUnrevoked,
     Error,
 }
 
@@ -67,6 +69,8 @@ impl AuditEventType {
             AuditEventType::AuthSuccess => "auth_success",
             AuditEventType::AuthFailure => "auth_failure",
             AuditEventType::RateLimitExceeded => "rate_limit_exceeded",
+            AuditEventType::TokenRevoked => "token_revoked",
+            AuditEventType::TokenUnrevoked => "token_unrevoked",
             AuditEventType::Error => "error",
         }
     }
@@ -402,6 +406,96 @@ impl TunnelDb {
         }
 
         Ok(count as i64)
+    }
+
+    // === Token Revocation ===
+
+    /// Revoke a token.
+    pub async fn revoke_token(
+        &self,
+        token_id: &str,
+        revoked_by: Option<&str>,
+        reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_tokens (token_id, revoked_by, reason, expires_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (token_id) DO UPDATE SET
+                revoked_at = NOW(),
+                revoked_by = EXCLUDED.revoked_by,
+                reason = EXCLUDED.reason,
+                expires_at = EXCLUDED.expires_at
+            "#,
+        )
+        .bind(token_id)
+        .bind(revoked_by)
+        .bind(reason)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        info!("Token {} revoked", token_id);
+        self.log_audit_event(
+            None,
+            AuditEventType::TokenRevoked,
+            None,
+            serde_json::json!({"token_id": token_id, "reason": reason}),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Check if a token is revoked.
+    pub async fn is_token_revoked(&self, token_id: &str) -> Result<bool> {
+        let result: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM revoked_tokens WHERE token_id = $1
+            "#,
+        )
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|(count,)| count > 0).unwrap_or(false))
+    }
+
+    /// Unrevoke a token (remove from revocation list).
+    pub async fn unrevoke_token(&self, token_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM revoked_tokens WHERE token_id = $1
+            "#,
+        )
+        .bind(token_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            info!("Token {} unrevoked", token_id);
+        }
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Cleanup expired revoked tokens.
+    pub async fn cleanup_expired_revoked_tokens(&self) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM revoked_tokens
+            WHERE expires_at IS NOT NULL AND expires_at < NOW()
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            info!("Cleaned up {} expired revoked tokens", result.rows_affected());
+        }
+
+        Ok(result.rows_affected() as i64)
     }
 
     /// Get the database pool for custom queries

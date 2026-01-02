@@ -76,6 +76,18 @@ pub struct ClientConfig {
     #[arg(long, env = "TUN_MAX_RECONNECTS", default_value = "0")]
     pub max_reconnects: u32,
 
+    /// Verify upstream connectivity before establishing tunnel
+    #[arg(long, env = "TUN_VERIFY_UPSTREAM", default_value = "true")]
+    pub verify_upstream: bool,
+
+    /// Require upstream to be reachable (exit if not)
+    #[arg(long, env = "TUN_REQUIRE_UPSTREAM", default_value = "false")]
+    pub require_upstream: bool,
+
+    /// Enable periodic health checks (interval in seconds, 0 to disable)
+    #[arg(long, env = "TUN_HEALTH_CHECK_INTERVAL", default_value = "0")]
+    pub health_check_interval: u64,
+
     /// Enable debug logging
     #[arg(long, env = "TUN_DEBUG")]
     pub debug: bool,
@@ -176,6 +188,9 @@ mod tests {
             insecure: false,
             reconnect_delay: 5,
             max_reconnects: 0,
+            verify_upstream: true,
+            require_upstream: false,
+            health_check_interval: 0,
             debug: false,
         }
     }

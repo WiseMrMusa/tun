@@ -128,6 +128,32 @@ impl std::fmt::Display for HttpMethod {
     }
 }
 
+/// HTTP version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpVersion {
+    /// HTTP/1.0
+    Http10,
+    /// HTTP/1.1 (default)
+    #[default]
+    Http11,
+    /// HTTP/2
+    H2,
+    /// HTTP/3
+    H3,
+}
+
+impl std::fmt::Display for HttpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpVersion::Http10 => write!(f, "HTTP/1.0"),
+            HttpVersion::Http11 => write!(f, "HTTP/1.1"),
+            HttpVersion::H2 => write!(f, "HTTP/2"),
+            HttpVersion::H3 => write!(f, "HTTP/3"),
+        }
+    }
+}
+
 /// HTTP request sent through the tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequestData {
@@ -136,6 +162,9 @@ pub struct HttpRequestData {
     pub headers: Vec<(String, String)>,
     #[serde(with = "base64_bytes")]
     pub body: Vec<u8>,
+    /// HTTP version (defaults to HTTP/1.1 for backwards compatibility)
+    #[serde(default)]
+    pub version: HttpVersion,
 }
 
 /// HTTP response sent through the tunnel.
@@ -145,6 +174,9 @@ pub struct HttpResponseData {
     pub headers: Vec<(String, String)>,
     #[serde(with = "base64_bytes")]
     pub body: Vec<u8>,
+    /// HTTP version (defaults to HTTP/1.1 for backwards compatibility)
+    #[serde(default)]
+    pub version: HttpVersion,
 }
 
 /// WebSocket frame opcode.

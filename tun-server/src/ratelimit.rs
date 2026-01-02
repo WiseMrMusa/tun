@@ -1,26 +1,33 @@
 //! Rate limiting middleware for tunnel server.
 //!
 //! Provides IP-based rate limiting for both the control plane and proxy endpoints
-//! using the governor crate with Tower integration.
+//! using the governor crate with Tower integration. Includes LRU-based cleanup
+//! to bound memory usage.
 
 use axum::{
+    body::Body,
     extract::ConnectInfo,
     http::{Request, Response, StatusCode},
-    body::Body,
 };
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
+use lru::LruCache;
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    sync::Arc,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Instant,
 };
 use tower::{Layer, Service};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Default maximum number of IPs to track.
+const DEFAULT_MAX_TRACKED_IPS: usize = 100_000;
 
 /// Configuration for rate limiting.
 #[derive(Debug, Clone)]
@@ -29,6 +36,8 @@ pub struct RateLimitConfig {
     pub requests_per_second: u32,
     /// Burst size (allows temporary spikes above the rate)
     pub burst_size: u32,
+    /// Maximum number of IPs to track (LRU eviction after this)
+    pub max_tracked_ips: usize,
 }
 
 impl Default for RateLimitConfig {
@@ -36,6 +45,7 @@ impl Default for RateLimitConfig {
         Self {
             requests_per_second: 100,
             burst_size: 200,
+            max_tracked_ips: DEFAULT_MAX_TRACKED_IPS,
         }
     }
 }
@@ -45,7 +55,14 @@ impl RateLimitConfig {
         Self {
             requests_per_second,
             burst_size,
+            max_tracked_ips: DEFAULT_MAX_TRACKED_IPS,
         }
+    }
+
+    /// Create a config with custom max tracked IPs.
+    pub fn with_max_tracked_ips(mut self, max_tracked_ips: usize) -> Self {
+        self.max_tracked_ips = max_tracked_ips;
+        self
     }
 
     /// Create a Quota from this configuration.
@@ -55,42 +72,95 @@ impl RateLimitConfig {
     }
 }
 
-/// Per-IP rate limiter using DashMap for concurrent access.
+/// Entry in the LRU cache for rate limiting.
+struct RateLimitEntry {
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    last_access: Instant,
+}
+
+/// Per-IP rate limiter with LRU-based memory management.
 pub struct IpRateLimiter {
-    limiters: dashmap::DashMap<IpAddr, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>,
+    /// LRU cache of rate limiters by IP
+    cache: Mutex<LruCache<IpAddr, RateLimitEntry>>,
+    /// Quota configuration
     quota: Quota,
+    /// Maximum number of IPs to track
+    max_tracked_ips: usize,
+    /// Counter for rate limited requests (for metrics)
+    rate_limited_count: std::sync::atomic::AtomicU64,
 }
 
 impl IpRateLimiter {
     pub fn new(config: &RateLimitConfig) -> Self {
+        let capacity = NonZeroUsize::new(config.max_tracked_ips).unwrap_or(NonZeroUsize::MIN);
         Self {
-            limiters: dashmap::DashMap::new(),
+            cache: Mutex::new(LruCache::new(capacity)),
             quota: config.to_quota(),
+            max_tracked_ips: config.max_tracked_ips,
+            rate_limited_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Check if a request from the given IP should be allowed.
     pub fn check(&self, ip: IpAddr) -> bool {
-        let limiter = self.limiters.entry(ip).or_insert_with(|| {
-            Arc::new(RateLimiter::direct(self.quota))
+        let mut cache = self.cache.lock().unwrap();
+
+        // Get or create entry for this IP
+        let entry = cache.get_or_insert_mut(ip, || RateLimitEntry {
+            limiter: RateLimiter::direct(self.quota),
+            last_access: Instant::now(),
         });
 
-        limiter.check().is_ok()
+        // Update last access time
+        entry.last_access = Instant::now();
+
+        // Check rate limit
+        let allowed = entry.limiter.check().is_ok();
+        if !allowed {
+            self.rate_limited_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        allowed
     }
 
     /// Get the number of tracked IPs (for monitoring).
     pub fn tracked_ips(&self) -> usize {
-        self.limiters.len()
+        self.cache.lock().unwrap().len()
     }
 
-    /// Clean up limiters for IPs that haven't been seen recently.
-    /// This should be called periodically to prevent memory growth.
-    pub fn cleanup(&self) {
-        // Remove entries that haven't been accessed (simple cleanup)
-        // In production, you'd want a more sophisticated approach
-        if self.limiters.len() > 10000 {
-            self.limiters.retain(|_, v| Arc::strong_count(v) > 1);
+    /// Get the number of rate limited requests since creation.
+    pub fn rate_limited_count(&self) -> u64 {
+        self.rate_limited_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clean up old entries that haven't been accessed recently.
+    /// This is in addition to the LRU eviction that happens automatically.
+    pub fn cleanup(&self, max_age_secs: u64) {
+        let mut cache = self.cache.lock().unwrap();
+        let cutoff = Instant::now() - std::time::Duration::from_secs(max_age_secs);
+
+        // Collect keys to remove (can't modify during iteration)
+        let keys_to_remove: Vec<IpAddr> = cache
+            .iter()
+            .filter(|(_, entry)| entry.last_access < cutoff)
+            .map(|(ip, _)| *ip)
+            .collect();
+
+        let removed = keys_to_remove.len();
+        for ip in keys_to_remove {
+            cache.pop(&ip);
         }
+
+        if removed > 0 {
+            info!("Rate limiter cleanup: removed {} stale entries", removed);
+        }
+    }
+
+    /// Get the maximum capacity.
+    pub fn max_capacity(&self) -> usize {
+        self.max_tracked_ips
     }
 }
 

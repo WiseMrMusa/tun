@@ -5,6 +5,13 @@ use clap::Parser;
 /// Default body size limit: 100MB
 pub const DEFAULT_BODY_SIZE_LIMIT: usize = 100 * 1024 * 1024;
 
+/// Default streaming threshold: 1MB
+/// Bodies larger than this will be streamed instead of buffered
+pub const DEFAULT_STREAMING_THRESHOLD: usize = 1024 * 1024;
+
+/// Default stream chunk size: 64KB
+pub const DEFAULT_STREAM_CHUNK_SIZE: usize = 64 * 1024;
+
 /// Default authentication timeout: 10 seconds
 pub const DEFAULT_AUTH_TIMEOUT: u64 = 10;
 
@@ -63,6 +70,15 @@ pub struct ServerConfig {
     #[arg(long, env = "TUN_BODY_SIZE_LIMIT", default_value = "104857600")]
     pub body_size_limit: usize,
 
+    /// Streaming threshold in bytes (default: 1MB)
+    /// Bodies larger than this will be streamed in chunks instead of buffered
+    #[arg(long, env = "TUN_STREAMING_THRESHOLD", default_value = "1048576")]
+    pub streaming_threshold: usize,
+
+    /// Stream chunk size in bytes (default: 64KB)
+    #[arg(long, env = "TUN_STREAM_CHUNK_SIZE", default_value = "65536")]
+    pub stream_chunk_size: usize,
+
     /// Authentication timeout in seconds
     #[arg(long, env = "TUN_AUTH_TIMEOUT", default_value = "10")]
     pub auth_timeout: u64,
@@ -100,6 +116,19 @@ pub struct ServerConfig {
     /// Enable debug logging
     #[arg(long, env = "TUN_DEBUG")]
     pub debug: bool,
+
+    /// Path to IP allowlist file (one IP/CIDR per line)
+    #[arg(long, env = "TUN_IP_ALLOWLIST")]
+    pub ip_allowlist_file: Option<String>,
+
+    /// Path to IP blocklist file (one IP/CIDR per line)
+    #[arg(long, env = "TUN_IP_BLOCKLIST")]
+    pub ip_blocklist_file: Option<String>,
+
+    /// Graceful shutdown timeout in seconds
+    /// If not set, uses default of 30 seconds
+    #[arg(long, env = "TUN_SHUTDOWN_TIMEOUT")]
+    pub shutdown_timeout: Option<u64>,
 }
 
 impl ServerConfig {

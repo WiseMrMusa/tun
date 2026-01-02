@@ -21,13 +21,14 @@ futures-util = "0.3"
 # HTTP
 axum = { version = "0.7", features = ["ws"] }
 hyper = { version = "1.1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "tokio", "server-auto"] }
 tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 http-body-util = "0.1"
+http = "1.0"
 
 # TLS
-rustls = "0.22"
+rustls = { version = "0.22", features = ["ring"] }
 tokio-rustls = "0.25"
 rustls-pemfile = "2.0"
 
@@ -42,6 +43,12 @@ clap = { version = "4.4", features = ["derive", "env"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Distributed Tracing
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["tonic"] }
+tracing-opentelemetry = "0.22"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
@@ -67,6 +74,10 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 pin-project-lite = "0.2"
+ipnet = "2.9"
+lru = "0.12"
+bb8 = "0.8"
+regex = "1.10"
 
 # Internal crates
 tun-core = { path = "tun-core" }

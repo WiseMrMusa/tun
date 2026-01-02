@@ -1,20 +1,60 @@
 //! Tunnel connection and local port forwarding.
+//!
+//! Supports both HTTP/1.1 and HTTP/2 for forwarding requests to local services.
+//! Also supports WebSocket frame forwarding.
 
 use crate::config::ClientConfig;
 use anyhow::Result;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::client::conn::http1::SendRequest;
 use hyper::{Method, Request};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use tokio::sync::mpsc;
+use tokio_tungstenite::{
+    connect_async as ws_connect_async,
+    tungstenite::protocol::Message as TungsteniteMessage,
+    MaybeTlsStream, WebSocketStream,
+};
 use tracing::{debug, error, info, warn};
 use tun_core::protocol::{
-    HttpMethod, HttpRequestData, HttpResponseData, Message, MessageType, Payload, RequestId,
+    HttpMethod, HttpRequestData, HttpResponseData, HttpVersion, Message, MessageType, Payload,
+    RequestId, WebSocketFrameData, WebSocketOpcode,
 };
+
+/// Active WebSocket sessions being relayed.
+struct WebSocketSessions {
+    /// Active sessions by request ID, with sender to forward frames to local WebSocket
+    sessions: DashMap<RequestId, mpsc::Sender<WebSocketFrameData>>,
+}
+
+impl WebSocketSessions {
+    fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+        }
+    }
+
+    fn register(&self, request_id: RequestId, tx: mpsc::Sender<WebSocketFrameData>) {
+        self.sessions.insert(request_id, tx);
+    }
+
+    fn unregister(&self, request_id: RequestId) {
+        self.sessions.remove(&request_id);
+    }
+
+    async fn forward_frame(&self, request_id: RequestId, frame: WebSocketFrameData) -> bool {
+        if let Some(tx) = self.sessions.get(&request_id) {
+            tx.send(frame).await.is_ok()
+        } else {
+            false
+        }
+    }
+}
 
 /// Run the tunnel with automatic reconnection.
 pub async fn run_tunnel_loop(config: &ClientConfig) -> Result<()> {
@@ -55,8 +95,11 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
     info!("Connecting to {}", url);
 
     // Connect to the tunnel server
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = ws_connect_async(&url).await?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    
+    // WebSocket session manager for frame forwarding
+    let ws_sessions = Arc::new(WebSocketSessions::new());
 
     // Authenticate (with optional custom subdomain)
     let auth_msg = match &config.subdomain {
@@ -64,7 +107,7 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
         None => Message::auth(config.token.clone()),
     };
     let auth_bytes = auth_msg.to_bytes()?;
-    ws_tx.send(WsMessage::Binary(auth_bytes.to_vec())).await?;
+    ws_tx.send(TungsteniteMessage::Binary(auth_bytes.to_vec())).await?;
 
     // Wait for authentication response or connected message
     let response = ws_rx
@@ -73,7 +116,7 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
 
     let response_data = match response {
-        WsMessage::Binary(data) => data,
+        TungsteniteMessage::Binary(data) => data,
         _ => return Err(anyhow::anyhow!("Unexpected message type")),
     };
 
@@ -127,7 +170,7 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
             tokio::select! {
                 Some(msg) = response_rx.recv() => {
                     if let Ok(bytes) = msg.to_bytes() {
-                        if ws_tx.send(WsMessage::Binary(bytes.to_vec())).await.is_err() {
+                        if ws_tx.send(TungsteniteMessage::Binary(bytes.to_vec())).await.is_err() {
                             break;
                         }
                     }
@@ -135,7 +178,7 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
                 Some(_) = heartbeat_rx.recv() => {
                     let ping = Message::ping();
                     if let Ok(bytes) = ping.to_bytes() {
-                        if ws_tx.send(WsMessage::Binary(bytes.to_vec())).await.is_err() {
+                        if ws_tx.send(TungsteniteMessage::Binary(bytes.to_vec())).await.is_err() {
                             break;
                         }
                     }
@@ -148,13 +191,14 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
     // Handle incoming messages
     while let Some(result) = ws_rx.next().await {
         match result {
-            Ok(WsMessage::Binary(data)) => {
+            Ok(TungsteniteMessage::Binary(data)) => {
                 match Message::from_bytes(&data) {
                     Ok(msg) => {
                         let response_tx = response_tx.clone();
                         let config = config.clone();
+                        let ws_sessions = ws_sessions.clone();
                         tokio::spawn(async move {
-                            handle_server_message(msg, &config, response_tx).await;
+                            handle_server_message(msg, &config, response_tx, ws_sessions).await;
                         });
                     }
                     Err(e) => {
@@ -162,10 +206,10 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
                     }
                 }
             }
-            Ok(WsMessage::Ping(_)) => {
+            Ok(TungsteniteMessage::Ping(_)) => {
                 debug!("Received ping from server");
             }
-            Ok(WsMessage::Close(_)) => {
+            Ok(TungsteniteMessage::Close(_)) => {
                 info!("Server closed connection");
                 break;
             }
@@ -188,25 +232,77 @@ async fn handle_server_message(
     msg: Message,
     config: &crate::config::ClientConfig,
     response_tx: tokio::sync::mpsc::Sender<Message>,
+    ws_sessions: Arc<WebSocketSessions>,
 ) {
     match msg.msg_type {
-        MessageType::HttpRequest | MessageType::WebSocketUpgrade => {
+        MessageType::HttpRequest => {
             let request_id = msg.request_id.unwrap_or_else(RequestId::new);
-            let is_ws_upgrade = msg.msg_type == MessageType::WebSocketUpgrade;
 
             if let Payload::HttpRequest(request_data) = msg.payload {
                 // Route to the appropriate local port based on path
                 let local_addr = config.local_addr_for_path(&request_data.uri);
                 let response = forward_http_request(&local_addr, request_data).await;
-                let response_msg = if is_ws_upgrade {
-                    Message::websocket_upgrade_response(request_id, response)
-                } else {
-                    Message::http_response(request_id, response)
-                };
+                let response_msg = Message::http_response(request_id, response);
 
                 if response_tx.send(response_msg).await.is_err() {
                     error!("Failed to send response");
                 }
+            }
+        }
+        MessageType::WebSocketUpgrade => {
+            let request_id = msg.request_id.unwrap_or_else(RequestId::new);
+
+            if let Payload::HttpRequest(request_data) = msg.payload {
+                let local_addr = config.local_addr_for_path(&request_data.uri);
+                
+                // Try to establish WebSocket connection to local service
+                match establish_local_websocket(&local_addr, &request_data).await {
+                    Ok((ws_stream, upgrade_response)) => {
+                        info!("WebSocket connected to local service for session {}", request_id);
+                        
+                        // Send successful upgrade response
+                        let response_msg = Message::websocket_upgrade_response(request_id, upgrade_response);
+                        if response_tx.send(response_msg).await.is_err() {
+                            error!("Failed to send WebSocket upgrade response");
+                            return;
+                        }
+                        
+                        // Start frame relay
+                        tokio::spawn(handle_websocket_relay(
+                            request_id,
+                            ws_stream,
+                            response_tx.clone(),
+                            ws_sessions.clone(),
+                        ));
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to local WebSocket: {}", e);
+                        let response = HttpResponseData {
+                            status: 502,
+                            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+                            body: format!("Failed to connect to local WebSocket: {}", e).into_bytes(),
+                            version: HttpVersion::Http11,
+                        };
+                        let response_msg = Message::websocket_upgrade_response(request_id, response);
+                        let _ = response_tx.send(response_msg).await;
+                    }
+                }
+            }
+        }
+        MessageType::WebSocketFrame => {
+            // Forward frame to local WebSocket
+            let request_id = msg.request_id.unwrap_or_else(RequestId::new);
+            if let Payload::WebSocketFrame(frame) = msg.payload {
+                if !ws_sessions.forward_frame(request_id, frame).await {
+                    debug!("Failed to forward WebSocket frame to local service for session {}", request_id);
+                }
+            }
+        }
+        MessageType::Close => {
+            // Close WebSocket session
+            if let Some(request_id) = msg.request_id {
+                ws_sessions.unregister(request_id);
+                debug!("Closed WebSocket session {}", request_id);
             }
         }
         MessageType::TcpData => {
@@ -239,6 +335,142 @@ async fn handle_server_message(
         _ => {
             debug!("Unhandled message type: {:?}", msg.msg_type);
         }
+    }
+}
+
+/// Establish a WebSocket connection to the local service.
+async fn establish_local_websocket(
+    local_addr: &str,
+    request_data: &HttpRequestData,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, HttpResponseData)> {
+    // Build the WebSocket URL
+    let ws_url = format!("ws://{}{}", local_addr, request_data.uri);
+    
+    debug!("Connecting to local WebSocket at {}", ws_url);
+    
+    // Connect to local WebSocket
+    let (ws_stream, response) = ws_connect_async(&ws_url).await?;
+    
+    // Convert response to our format
+    let upgrade_response = HttpResponseData {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
+            })
+            .collect(),
+        body: vec![],
+        version: HttpVersion::Http11,
+    };
+    
+    Ok((ws_stream, upgrade_response))
+}
+
+/// Handle bidirectional WebSocket frame relay between server and local service.
+async fn handle_websocket_relay(
+    request_id: RequestId,
+    ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    response_tx: mpsc::Sender<Message>,
+    ws_sessions: Arc<WebSocketSessions>,
+) {
+    let (mut local_tx, mut local_rx) = ws_stream.split();
+    
+    // Create channel for forwarding frames to local WebSocket
+    let (to_local_tx, mut to_local_rx) = mpsc::channel::<WebSocketFrameData>(100);
+    ws_sessions.register(request_id, to_local_tx);
+    
+    info!("WebSocket relay started for session {}", request_id);
+    
+    // Task to forward frames from server to local
+    let to_local_task = tokio::spawn(async move {
+        while let Some(frame) = to_local_rx.recv().await {
+            let msg = frame_to_tungstenite_message(frame);
+            if local_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    
+    // Forward frames from local to server
+    while let Some(result) = local_rx.next().await {
+        match result {
+            Ok(msg) => {
+                if let Some(frame) = tungstenite_message_to_frame(&msg) {
+                    let frame_msg = Message::websocket_frame(request_id, frame);
+                    if response_tx.send(frame_msg).await.is_err() {
+                        break;
+                    }
+                }
+                
+                // Check for close frame
+                if matches!(msg, TungsteniteMessage::Close(_)) {
+                    break;
+                }
+            }
+            Err(e) => {
+                debug!("Local WebSocket error: {}", e);
+                break;
+            }
+        }
+    }
+    
+    // Clean up
+    to_local_task.abort();
+    ws_sessions.unregister(request_id);
+    
+    // Notify server that WebSocket is closing
+    let close_msg = Message::close(request_id);
+    let _ = response_tx.send(close_msg).await;
+    
+    info!("WebSocket relay ended for session {}", request_id);
+}
+
+/// Convert our WebSocketFrameData to a tungstenite Message.
+fn frame_to_tungstenite_message(frame: WebSocketFrameData) -> TungsteniteMessage {
+    match frame.opcode {
+        WebSocketOpcode::Text => {
+            let text = String::from_utf8_lossy(&frame.payload).to_string();
+            TungsteniteMessage::Text(text)
+        }
+        WebSocketOpcode::Binary => TungsteniteMessage::Binary(frame.payload),
+        WebSocketOpcode::Ping => TungsteniteMessage::Ping(frame.payload),
+        WebSocketOpcode::Pong => TungsteniteMessage::Pong(frame.payload),
+        WebSocketOpcode::Close => TungsteniteMessage::Close(None),
+        WebSocketOpcode::Continuation => TungsteniteMessage::Binary(frame.payload),
+    }
+}
+
+/// Convert a tungstenite Message to our WebSocketFrameData.
+fn tungstenite_message_to_frame(msg: &TungsteniteMessage) -> Option<WebSocketFrameData> {
+    match msg {
+        TungsteniteMessage::Text(text) => Some(WebSocketFrameData {
+            opcode: WebSocketOpcode::Text,
+            payload: text.as_bytes().to_vec(),
+            fin: true,
+        }),
+        TungsteniteMessage::Binary(data) => Some(WebSocketFrameData {
+            opcode: WebSocketOpcode::Binary,
+            payload: data.clone(),
+            fin: true,
+        }),
+        TungsteniteMessage::Ping(data) => Some(WebSocketFrameData {
+            opcode: WebSocketOpcode::Ping,
+            payload: data.clone(),
+            fin: true,
+        }),
+        TungsteniteMessage::Pong(data) => Some(WebSocketFrameData {
+            opcode: WebSocketOpcode::Pong,
+            payload: data.clone(),
+            fin: true,
+        }),
+        TungsteniteMessage::Close(_) => Some(WebSocketFrameData {
+            opcode: WebSocketOpcode::Close,
+            payload: vec![],
+            fin: true,
+        }),
+        TungsteniteMessage::Frame(_) => None, // Raw frames are not directly handled
     }
 }
 
@@ -281,9 +513,18 @@ async fn forward_tcp_data(local_addr: &str, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 async fn forward_http_request(local_addr: &str, request: HttpRequestData) -> HttpResponseData {
-    debug!("Forwarding {} {} to {}", request.method, request.uri, local_addr);
+    debug!(
+        "Forwarding {} {} {} to {}",
+        request.version, request.method, request.uri, local_addr
+    );
 
-    match forward_with_hyper(local_addr, &request).await {
+    // Choose HTTP version based on request
+    let result = match request.version {
+        HttpVersion::H2 => forward_with_http2(local_addr, &request).await,
+        _ => forward_with_http1(local_addr, &request).await,
+    };
+
+    match result {
         Ok(response) => response,
         Err(e) => {
             error!("Failed to forward request: {}", e);
@@ -291,13 +532,14 @@ async fn forward_http_request(local_addr: &str, request: HttpRequestData) -> Htt
                 status: 502,
                 headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
                 body: format!("Failed to connect to local service: {}", e).into_bytes(),
+                version: HttpVersion::Http11,
             }
         }
     }
 }
 
-/// Forward an HTTP request to the local service using hyper.
-async fn forward_with_hyper(
+/// Forward an HTTP/1.1 request to the local service using hyper.
+async fn forward_with_http1(
     local_addr: &str,
     request_data: &HttpRequestData,
 ) -> Result<HttpResponseData> {
@@ -311,22 +553,54 @@ async fn forward_with_hyper(
     // Spawn connection driver
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            debug!("Connection error: {}", e);
+            debug!("HTTP/1.1 connection error: {}", e);
         }
     });
 
-    // Build the request
-    let response = send_request(&mut sender, request_data, local_addr).await?;
-    
-    Ok(response)
+    // Build request
+    let req = build_hyper_request(request_data, local_addr)?;
+
+    // Send request
+    let response = sender.send_request(req).await?;
+
+    // Convert response
+    convert_hyper_response(response, HttpVersion::Http11).await
 }
 
-/// Send an HTTP request using hyper and convert the response.
-async fn send_request(
-    sender: &mut SendRequest<Full<Bytes>>,
+/// Forward an HTTP/2 request to the local service using hyper.
+async fn forward_with_http2(
+    local_addr: &str,
+    request_data: &HttpRequestData,
+) -> Result<HttpResponseData> {
+    // Connect to local service
+    let stream = TcpStream::connect(local_addr).await?;
+    let io = TokioIo::new(stream);
+
+    // Create HTTP/2 connection (h2c - HTTP/2 over cleartext)
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
+
+    // Spawn connection driver
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("HTTP/2 connection error: {}", e);
+        }
+    });
+
+    // Build request
+    let req = build_hyper_request(request_data, local_addr)?;
+
+    // Send request
+    let response = sender.send_request(req).await?;
+
+    // Convert response
+    convert_hyper_response(response, HttpVersion::H2).await
+}
+
+/// Build a hyper request from our HttpRequestData.
+fn build_hyper_request(
     request_data: &HttpRequestData,
     local_addr: &str,
-) -> Result<HttpResponseData> {
+) -> Result<Request<Full<Bytes>>> {
     // Convert method
     let method = match request_data.method {
         HttpMethod::Get => Method::GET,
@@ -368,16 +642,24 @@ async fn send_request(
     let body = Full::new(Bytes::from(request_data.body.clone()));
     let req = builder.body(body)?;
 
-    // Send request
-    let response = sender.send_request(req).await?;
-
-    // Convert response
-    convert_hyper_response(response).await
+    Ok(req)
 }
 
 /// Convert a hyper response to our HttpResponseData format.
-async fn convert_hyper_response(response: hyper::Response<Incoming>) -> Result<HttpResponseData> {
+async fn convert_hyper_response(
+    response: hyper::Response<Incoming>,
+    version: HttpVersion,
+) -> Result<HttpResponseData> {
     let status = response.status().as_u16();
+
+    // Determine actual HTTP version from response
+    let actual_version = match response.version() {
+        hyper::Version::HTTP_10 => HttpVersion::Http10,
+        hyper::Version::HTTP_11 => HttpVersion::Http11,
+        hyper::Version::HTTP_2 => HttpVersion::H2,
+        hyper::Version::HTTP_3 => HttpVersion::H3,
+        _ => version,
+    };
 
     // Extract headers
     let headers: Vec<(String, String)> = response
@@ -395,6 +677,7 @@ async fn convert_hyper_response(response: hyper::Response<Incoming>) -> Result<H
         status,
         headers,
         body,
+        version: actual_version,
     })
 }
 

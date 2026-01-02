@@ -2,7 +2,9 @@
 
 use crate::config::ServerConfig;
 use crate::db::TunnelDb;
+use crate::metrics;
 use crate::ratelimit::{IpRateLimiter, RateLimitLayer};
+use crate::websocket::WebSocketManager;
 use anyhow::Result;
 use axum::{
     extract::{
@@ -21,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use tun_core::{
     auth::TokenValidator,
-    protocol::{Message, MessageType, Payload, RequestId, TunnelId},
+    protocol::{Message, MessageType, Payload, RequestId, TunnelId, WebSocketFrameData},
 };
 
 /// A pending HTTP request waiting for a response from the tunnel client.
@@ -41,6 +43,8 @@ pub struct TunnelConnection {
     pub pending_requests: DashMap<RequestId, PendingRequest>,
     /// Request timeout in seconds
     pub request_timeout: u64,
+    /// WebSocket session manager for frame forwarding
+    pub websocket_manager: WebSocketManager,
 }
 
 impl TunnelConnection {
@@ -51,6 +55,7 @@ impl TunnelConnection {
             tx,
             pending_requests: DashMap::new(),
             request_timeout,
+            websocket_manager: WebSocketManager::new(),
         }
     }
 
@@ -66,6 +71,7 @@ impl TunnelConnection {
             tx,
             pending_requests: DashMap::new(),
             request_timeout,
+            websocket_manager: WebSocketManager::new(),
         }
     }
 
@@ -98,6 +104,30 @@ impl TunnelConnection {
                 let _ = pending.response_tx.send(msg);
             }
         }
+    }
+
+    /// Send a message to the tunnel client (for WebSocket frames).
+    pub async fn send_message(&self, msg: Message) -> Result<(), anyhow::Error> {
+        self.tx.send(msg).await?;
+        Ok(())
+    }
+
+    /// Register a WebSocket session and return the frame receiver.
+    pub fn register_websocket_session(
+        &self,
+        request_id: RequestId,
+    ) -> mpsc::Receiver<WebSocketFrameData> {
+        self.websocket_manager.register_session(request_id)
+    }
+
+    /// Unregister a WebSocket session.
+    pub fn unregister_websocket_session(&self, request_id: RequestId) {
+        self.websocket_manager.unregister_session(request_id);
+    }
+
+    /// Forward a WebSocket frame from the tunnel client to the public client.
+    pub async fn forward_websocket_frame(&self, request_id: RequestId, frame: WebSocketFrameData) -> bool {
+        self.websocket_manager.forward_to_client(request_id, frame).await
     }
 }
 
@@ -164,6 +194,9 @@ impl TunnelRegistry {
             }
         }
         
+        // Record metrics
+        metrics::record_tunnel_connected(&tunnel.id.to_string(), &tunnel.subdomain);
+        
         self.tunnels_by_subdomain
             .insert(tunnel.subdomain.clone(), tunnel.clone());
         self.tunnels_by_id.insert(tunnel.id, tunnel);
@@ -174,6 +207,9 @@ impl TunnelRegistry {
         if let Some((_, tunnel)) = self.tunnels_by_id.remove(&tunnel_id) {
             info!("Unregistering tunnel {}", tunnel_id);
             self.tunnels_by_subdomain.remove(&tunnel.subdomain);
+            
+            // Record metrics
+            metrics::record_tunnel_disconnected(&tunnel_id.to_string());
             
             // Update database if available
             if let Some(ref db) = self.db {
@@ -192,6 +228,18 @@ impl TunnelRegistry {
     /// Get the number of active tunnels.
     pub fn count(&self) -> usize {
         self.tunnels_by_id.len()
+    }
+
+    /// List all active tunnels.
+    /// Returns tuples of (tunnel_id, subdomain, pending_request_count).
+    pub fn list_tunnels(&self) -> Vec<(TunnelId, String, usize)> {
+        self.tunnels_by_id
+            .iter()
+            .map(|entry| {
+                let tunnel = entry.value();
+                (tunnel.id, tunnel.subdomain.clone(), tunnel.pending_requests.len())
+            })
+            .collect()
     }
 
     /// Check if we can accept more tunnels.
@@ -280,8 +328,12 @@ async fn handle_tunnel_connection(
     let auth_result = authenticate_client(&mut ws_rx, &registry).await;
 
     let (tunnel_id, token_id, subdomain) = match auth_result {
-        Ok(result) => result,
+        Ok(result) => {
+            metrics::record_auth_attempt(true);
+            result
+        }
         Err(e) => {
+            metrics::record_auth_attempt(false);
             error!("Authentication failed: {}", e);
             let error_msg = Message::error(401, e.to_string());
             if let Ok(bytes) = error_msg.to_bytes() {
@@ -463,18 +515,29 @@ async fn handle_client_message(tunnel: &TunnelConnection, msg: Message) {
         MessageType::Pong => {
             debug!("Pong from tunnel {}", tunnel.id);
         }
+        MessageType::WebSocketFrame => {
+            // Forward WebSocket frames through the WebSocket manager
+            if let Some(request_id) = msg.request_id {
+                if let Payload::WebSocketFrame(frame) = msg.payload {
+                    if !tunnel.forward_websocket_frame(request_id, frame).await {
+                        debug!("Failed to forward WebSocket frame for session {}", request_id);
+                    }
+                }
+            }
+        }
         MessageType::HttpResponse
         | MessageType::WebSocketUpgradeResponse
         | MessageType::TcpData
-        | MessageType::WebSocketFrame
         | MessageType::StreamChunk
         | MessageType::StreamEnd => {
-            // All response types are handled the same way - route to pending request
+            // Route to pending request
             tunnel.handle_response(msg);
         }
         MessageType::Close => {
             if let Some(request_id) = msg.request_id {
                 tunnel.pending_requests.remove(&request_id);
+                // Also clean up any WebSocket session
+                tunnel.unregister_websocket_session(request_id);
             }
         }
         _ => {

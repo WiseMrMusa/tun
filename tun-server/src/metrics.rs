@@ -122,6 +122,91 @@ pub fn record_server_start() {
     gauge!("tun_server_uptime_seconds").set(0.0);
 }
 
+/// Record a WebSocket connection.
+pub fn record_websocket_connected() {
+    counter!("tun_websocket_connections_total").increment(1);
+    gauge!("tun_active_websocket_connections").increment(1.0);
+}
+
+/// Record a WebSocket disconnection.
+pub fn record_websocket_disconnected() {
+    gauge!("tun_active_websocket_connections").decrement(1.0);
+}
+
+/// Record WebSocket frames.
+pub fn record_websocket_frame(direction: &str, bytes: usize) {
+    counter!("tun_websocket_frames_total",
+        "direction" => direction.to_string()
+    ).increment(1);
+    counter!("tun_websocket_bytes_total",
+        "direction" => direction.to_string()
+    ).increment(bytes as u64);
+}
+
+/// Record an IP block event.
+pub fn record_ip_blocked(client_ip: &str, reason: &str) {
+    counter!("tun_ip_blocked_total",
+        "reason" => reason.to_string()
+    ).increment(1);
+}
+
+/// Record a request timeout.
+pub fn record_request_timeout(tunnel_id: &str) {
+    counter!("tun_request_timeouts_total",
+        "tunnel" => tunnel_id.to_string()
+    ).increment(1);
+}
+
+/// Record upstream connection error.
+pub fn record_upstream_error(tunnel_id: &str, error_type: &str) {
+    counter!("tun_upstream_errors_total",
+        "tunnel" => tunnel_id.to_string(),
+        "error_type" => error_type.to_string()
+    ).increment(1);
+}
+
+/// Record request body size.
+pub fn record_request_body_size(bytes: usize) {
+    histogram!("tun_request_body_bytes").record(bytes as f64);
+}
+
+/// Record response body size.
+pub fn record_response_body_size(bytes: usize) {
+    histogram!("tun_response_body_bytes").record(bytes as f64);
+}
+
+/// Record connection pool stats.
+pub fn set_connection_pool_size(pool_name: &str, active: usize, idle: usize) {
+    gauge!("tun_connection_pool_active",
+        "pool" => pool_name.to_string()
+    ).set(active as f64);
+    gauge!("tun_connection_pool_idle",
+        "pool" => pool_name.to_string()
+    ).set(idle as f64);
+}
+
+/// Record streaming chunk sent.
+pub fn record_stream_chunk(tunnel_id: &str, bytes: usize) {
+    counter!("tun_stream_chunks_total",
+        "tunnel" => tunnel_id.to_string()
+    ).increment(1);
+    counter!("tun_stream_bytes_total",
+        "tunnel" => tunnel_id.to_string()
+    ).increment(bytes as u64);
+}
+
+/// Record token revocation.
+pub fn record_token_revoked() {
+    counter!("tun_tokens_revoked_total").increment(1);
+}
+
+/// Record validation rejection.
+pub fn record_validation_rejected(reason: &str) {
+    counter!("tun_validation_rejected_total",
+        "reason" => reason.to_string()
+    ).increment(1);
+}
+
 /// Create a metrics router that serves the /metrics endpoint.
 pub fn metrics_router(metrics: Arc<TunnelMetrics>) -> Router {
     Router::new()

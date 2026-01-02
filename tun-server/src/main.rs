@@ -2,20 +2,34 @@
 //!
 //! Runs on a public VPS to accept tunnel connections and proxy traffic.
 
+mod acl;
+mod api;
+mod cluster;
 mod config;
+mod dashboard;
 mod db;
+mod grpc;
+mod ipfilter;
+mod limits;
 mod metrics;
 mod multiplex;
 mod proxy;
 mod ratelimit;
+mod shutdown;
+mod sse;
 mod tls;
+mod tracing_otel;
+mod transform;
 mod tunnel;
+mod validation;
+mod websocket;
 
 use anyhow::Result;
 use clap::Parser;
 use config::ServerConfig;
 use db::{DbConfig, TunnelDb};
 use ratelimit::{create_shared_limiter, RateLimitConfig};
+use shutdown::GracefulShutdown;
 use std::sync::Arc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -151,9 +165,29 @@ async fn main() -> Result<()> {
 
     info!("Server is ready to accept connections");
 
+    // Setup graceful shutdown with configurable timeout
+    let shutdown_timeout = config.shutdown_timeout.unwrap_or(shutdown::DEFAULT_SHUTDOWN_TIMEOUT_SECS);
+    let graceful = GracefulShutdown::new(shutdown_timeout);
+    let shutdown_signal = graceful.signal();
+
     // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    graceful.wait_for_signal().await;
+
+    info!("Initiating graceful shutdown (timeout: {}s)...", shutdown_timeout);
+
+    // Notify all tunnels of pending shutdown
+    let tunnel_count = state.count();
+    if tunnel_count > 0 {
+        info!("Draining {} active tunnel(s)...", tunnel_count);
+    }
+
+    // Wait for connections to drain
+    let drained = graceful.shutdown().await;
+    if drained {
+        info!("All connections drained successfully");
+    } else {
+        warn!("Shutdown timeout reached, forcing shutdown");
+    }
 
     // Graceful shutdown: mark all tunnels as disconnected in database
     if let Some(ref db) = db {
@@ -163,13 +197,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Cleanup
+    // Cleanup server tasks
+    info!("Stopping server tasks...");
     control_handle.abort();
     proxy_handle.abort();
     if let Some(handle) = metrics_handle {
         handle.abort();
     }
 
+    // Drop the shutdown signal to clean up resources
+    drop(shutdown_signal);
+
+    info!("Shutdown complete");
     Ok(())
 }
 

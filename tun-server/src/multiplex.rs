@@ -20,7 +20,7 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, error, info};
-use tun_core::protocol::{HttpMethod, HttpRequestData, HttpResponseData, Message, RequestId};
+use tun_core::protocol::{HttpMethod, HttpRequestData, HttpResponseData, HttpVersion, Message, RequestId};
 
 /// State for the multiplexed server
 #[derive(Clone)]
@@ -178,6 +178,15 @@ async fn convert_request(
         _ => HttpMethod::Get,
     };
 
+    // Determine HTTP version
+    let version = match request.version() {
+        axum::http::Version::HTTP_10 => HttpVersion::Http10,
+        axum::http::Version::HTTP_11 => HttpVersion::Http11,
+        axum::http::Version::HTTP_2 => HttpVersion::H2,
+        axum::http::Version::HTTP_3 => HttpVersion::H3,
+        _ => HttpVersion::Http11,
+    };
+
     let uri = request.uri().to_string();
 
     let headers: Vec<(String, String)> = request
@@ -195,6 +204,7 @@ async fn convert_request(
         uri,
         headers,
         body: body.to_vec(),
+        version,
     })
 }
 
