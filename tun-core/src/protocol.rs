@@ -73,8 +73,18 @@ pub enum MessageType {
     HttpRequest,
     /// HTTP response data from client to server
     HttpResponse,
+    /// WebSocket upgrade request (HTTP request with upgrade headers)
+    WebSocketUpgrade,
+    /// WebSocket upgrade response (101 Switching Protocols)
+    WebSocketUpgradeResponse,
+    /// WebSocket frame data (bidirectional)
+    WebSocketFrame,
     /// Raw TCP data
     TcpData,
+    /// HTTP request/response stream chunk (for large bodies)
+    StreamChunk,
+    /// End of stream marker
+    StreamEnd,
     /// Heartbeat/ping message
     Ping,
     /// Heartbeat/pong response
@@ -137,14 +147,87 @@ pub struct HttpResponseData {
     pub body: Vec<u8>,
 }
 
+/// WebSocket frame opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketOpcode {
+    /// Continuation frame
+    Continuation,
+    /// Text frame
+    Text,
+    /// Binary frame
+    Binary,
+    /// Close frame
+    Close,
+    /// Ping frame
+    Ping,
+    /// Pong frame
+    Pong,
+}
+
+impl From<u8> for WebSocketOpcode {
+    fn from(opcode: u8) -> Self {
+        match opcode {
+            0 => WebSocketOpcode::Continuation,
+            1 => WebSocketOpcode::Text,
+            2 => WebSocketOpcode::Binary,
+            8 => WebSocketOpcode::Close,
+            9 => WebSocketOpcode::Ping,
+            10 => WebSocketOpcode::Pong,
+            _ => WebSocketOpcode::Binary, // Default to binary for unknown
+        }
+    }
+}
+
+impl From<WebSocketOpcode> for u8 {
+    fn from(opcode: WebSocketOpcode) -> Self {
+        match opcode {
+            WebSocketOpcode::Continuation => 0,
+            WebSocketOpcode::Text => 1,
+            WebSocketOpcode::Binary => 2,
+            WebSocketOpcode::Close => 8,
+            WebSocketOpcode::Ping => 9,
+            WebSocketOpcode::Pong => 10,
+        }
+    }
+}
+
+/// WebSocket frame data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketFrameData {
+    /// Frame opcode
+    pub opcode: WebSocketOpcode,
+    /// Frame payload
+    #[serde(with = "base64_bytes")]
+    pub payload: Vec<u8>,
+    /// Whether this is the final frame in a message
+    pub fin: bool,
+}
+
+/// Stream chunk data for large request/response bodies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChunkData {
+    /// Chunk sequence number
+    pub chunk_index: u32,
+    /// Whether this is the final chunk
+    pub is_final: bool,
+    /// Chunk data
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+}
+
 /// Message payload variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Payload {
     /// Empty payload
     Empty,
-    /// Authentication token
-    Auth { token: String },
+    /// Authentication token with optional custom subdomain
+    Auth {
+        token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_subdomain: Option<String>,
+    },
     /// Authentication result
     AuthResult { success: bool, message: String },
     /// Connection established
@@ -156,6 +239,10 @@ pub enum Payload {
     HttpRequest(HttpRequestData),
     /// HTTP response
     HttpResponse(HttpResponseData),
+    /// WebSocket frame
+    WebSocketFrame(WebSocketFrameData),
+    /// Stream chunk for large bodies
+    StreamChunk(StreamChunkData),
     /// Raw TCP data
     TcpData {
         #[serde(with = "base64_bytes")]
@@ -209,7 +296,18 @@ impl Message {
 
     /// Create an auth message.
     pub fn auth(token: String) -> Self {
-        Self::new(MessageType::Auth, Payload::Auth { token })
+        Self::new(MessageType::Auth, Payload::Auth {
+            token,
+            requested_subdomain: None,
+        })
+    }
+
+    /// Create an auth message with a custom subdomain request.
+    pub fn auth_with_subdomain(token: String, subdomain: String) -> Self {
+        Self::new(MessageType::Auth, Payload::Auth {
+            token,
+            requested_subdomain: Some(subdomain),
+        })
     }
 
     /// Create an auth response message.
@@ -272,6 +370,42 @@ impl Message {
     /// Create a disconnect message.
     pub fn disconnect() -> Self {
         Self::new(MessageType::Disconnect, Payload::Empty)
+    }
+
+    /// Create a WebSocket frame message.
+    pub fn websocket_frame(request_id: RequestId, frame: WebSocketFrameData) -> Self {
+        Self::new(MessageType::WebSocketFrame, Payload::WebSocketFrame(frame))
+            .with_request_id(request_id)
+    }
+
+    /// Create a WebSocket upgrade request (uses HttpRequest payload with upgrade headers).
+    pub fn websocket_upgrade(request_id: RequestId, data: HttpRequestData) -> Self {
+        Self::new(MessageType::WebSocketUpgrade, Payload::HttpRequest(data))
+            .with_request_id(request_id)
+    }
+
+    /// Create a WebSocket upgrade response.
+    pub fn websocket_upgrade_response(request_id: RequestId, data: HttpResponseData) -> Self {
+        Self::new(MessageType::WebSocketUpgradeResponse, Payload::HttpResponse(data))
+            .with_request_id(request_id)
+    }
+
+    /// Create a stream chunk message.
+    pub fn stream_chunk(request_id: RequestId, chunk: StreamChunkData) -> Self {
+        Self::new(MessageType::StreamChunk, Payload::StreamChunk(chunk))
+            .with_request_id(request_id)
+    }
+
+    /// Create a stream end message.
+    pub fn stream_end(request_id: RequestId) -> Self {
+        Self::new(MessageType::StreamEnd, Payload::Empty)
+            .with_request_id(request_id)
+    }
+
+    /// Create a TCP data message.
+    pub fn tcp_data(request_id: RequestId, data: Vec<u8>) -> Self {
+        Self::new(MessageType::TcpData, Payload::TcpData { data })
+            .with_request_id(request_id)
     }
 
     /// Serialize to JSON bytes.

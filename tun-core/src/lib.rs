@@ -6,6 +6,9 @@
 pub mod auth;
 pub mod protocol;
 
-pub use auth::{AuthToken, TokenValidator};
-pub use protocol::{Message, MessageType, TunnelId};
+pub use auth::{AuthError, AuthToken, TokenValidator, DEFAULT_TOKEN_TTL_SECONDS};
+pub use protocol::{
+    HttpMethod, HttpRequestData, HttpResponseData, Message, MessageType, Payload, RequestId,
+    StreamChunkData, TunnelId, WebSocketFrameData, WebSocketOpcode,
+};
 
