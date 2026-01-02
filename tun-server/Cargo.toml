@@ -1,0 +1,54 @@
+[package]
+name = "tun-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Server component for the tun tunneling service"
+
+[[bin]]
+name = "tun-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "tun-token"
+path = "src/bin/token.rs"
+
+[dependencies]
+tun-core = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+# HTTP
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# TLS
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+
