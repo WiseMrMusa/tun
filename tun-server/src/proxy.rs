@@ -12,10 +12,13 @@
 //! - Per-path body size limits
 
 use crate::acl::{AclDenied, AclManager};
+use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
+use crate::cluster::{route_to_peer, DbClusterCoordinator};
 use crate::ipfilter::IpFilter;
 use crate::limits::BodyLimiter;
 use crate::metrics;
 use crate::ratelimit::{IpRateLimiter, RateLimitLayer};
+use crate::shutdown::ShutdownSignal;
 use crate::tls;
 pub use crate::transform::TransformConfig;
 use crate::transform::TransformLayer;
@@ -43,7 +46,7 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use tracing::{debug, error, info, warn};
@@ -59,6 +62,27 @@ pub struct ProxyTlsConfig {
     pub key_path: String,
 }
 
+/// Configuration for retry behavior.
+#[derive(Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Base delay between retries
+    pub retry_delay: Duration,
+    /// HTTP status codes that are retryable
+    pub retryable_status_codes: Vec<u16>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            retry_delay: Duration::from_millis(100),
+            retryable_status_codes: vec![502, 503, 504],
+        }
+    }
+}
+
 /// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -72,6 +96,14 @@ pub struct AppState {
     pub body_limiter: Arc<BodyLimiter>,
     /// Request validator for security checks
     pub validator: Arc<RequestValidator>,
+    /// Optional cluster coordinator for cross-server routing
+    pub cluster_coordinator: Option<Arc<DbClusterCoordinator>>,
+    /// Circuit breaker manager for tunnel health
+    pub circuit_breakers: Arc<CircuitBreakerManager>,
+    /// Optional shutdown signal for graceful request draining
+    pub shutdown_signal: Option<ShutdownSignal>,
+    /// Retry configuration
+    pub retry_config: RetryConfig,
 }
 
 impl AppState {
@@ -89,7 +121,35 @@ impl AppState {
             acl_manager,
             body_limiter,
             validator,
+            cluster_coordinator: None,
+            circuit_breakers: Arc::new(CircuitBreakerManager::new(CircuitBreakerConfig::default())),
+            shutdown_signal: None,
+            retry_config: RetryConfig::default(),
         }
+    }
+
+    /// Set the cluster coordinator for cross-server routing.
+    pub fn with_cluster_coordinator(mut self, coordinator: Arc<DbClusterCoordinator>) -> Self {
+        self.cluster_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Set the shutdown signal for graceful request draining.
+    pub fn with_shutdown_signal(mut self, signal: ShutdownSignal) -> Self {
+        self.shutdown_signal = Some(signal);
+        self
+    }
+
+    /// Set the retry configuration.
+    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+        self.retry_config = config;
+        self
+    }
+
+    /// Set the circuit breaker manager.
+    pub fn with_circuit_breakers(mut self, manager: Arc<CircuitBreakerManager>) -> Self {
+        self.circuit_breakers = manager;
+        self
     }
 }
 
@@ -305,6 +365,77 @@ async fn proxy_handler(
     let tunnel = match state.registry.get_by_subdomain(&subdomain) {
         Some(t) => t,
         None => {
+            // Tunnel not found locally - check if it's on another server in the cluster
+            if let Some(ref cluster_coord) = state.cluster_coordinator {
+                if let Some(peer_addr) = cluster_coord.find_tunnel_server(&subdomain).await {
+                    debug!(
+                        "Tunnel '{}' found on peer server {}, forwarding request",
+                        subdomain, peer_addr
+                    );
+
+                    // Extract request details for forwarding
+                    let method = request.method().to_string();
+                    let path = request.uri().path_and_query()
+                        .map(|pq| pq.to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    let headers: Vec<(String, String)> = request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+
+                    // Collect body (limited for cluster forwarding)
+                    let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(e) => {
+                            warn!("Failed to read request body for cluster forwarding: {}", e);
+                            return json_error_response(
+                                StatusCode::BAD_REQUEST,
+                                "body_read_error",
+                                "Failed to read request body",
+                                false,
+                            );
+                        }
+                    };
+
+                    // Forward to peer
+                    match route_to_peer(&peer_addr, &method, &path, &headers, &body_bytes).await {
+                        Ok((status, resp_headers, resp_body)) => {
+                            let elapsed = start_time.elapsed();
+                            metrics::record_request(&subdomain, status, elapsed.as_millis() as f64, body_bytes.len() as u64, resp_body.len() as u64);
+                            metrics::record_cluster_forward(&peer_addr, true);
+
+                            let mut response = Response::builder()
+                                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+
+                            for (name, value) in resp_headers {
+                                if let Ok(header_value) = value.parse::<axum::http::HeaderValue>() {
+                                    response = response.header(&name, header_value);
+                                }
+                            }
+
+                            return response
+                                .body(Body::from(resp_body))
+                                .unwrap_or_else(|_| {
+                                    Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(Body::from("Internal error"))
+                                        .unwrap()
+                                });
+                        }
+                        Err(e) => {
+                            warn!("Failed to forward request to peer {}: {}", peer_addr, e);
+                            return json_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "cluster_forward_error",
+                                &format!("Failed to forward request to cluster peer: {}", e),
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+
             debug!("No tunnel found for subdomain: {}", subdomain);
             return json_error_response(
                 StatusCode::NOT_FOUND,
@@ -905,6 +1036,25 @@ fn json_error_response(
             "retryable": retryable,
         }
     });
+
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"error":{"code":"internal_error","message":"Internal server error"}}"#))
+                .unwrap()
+        })
+}
+
+/// Convert a TunnelError to an HTTP response.
+/// Uses the structured error format from tun-core.
+fn tunnel_error_response(err: tun_core::TunnelError) -> Response<Body> {
+    let status = StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = err.to_json();
 
     Response::builder()
         .status(status)
