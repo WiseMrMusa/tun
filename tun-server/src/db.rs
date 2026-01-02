@@ -507,6 +507,128 @@ impl TunnelDb {
     pub fn server_id(&self) -> &str {
         &self.server_id
     }
+
+    // === Cluster Peer Discovery ===
+
+    /// Register or update this server as a peer in the cluster.
+    pub async fn register_peer(&self, internal_addr: &str, tunnel_count: i32) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_peers (server_id, internal_addr, tunnel_count, last_heartbeat)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (server_id) DO UPDATE SET
+                internal_addr = EXCLUDED.internal_addr,
+                tunnel_count = EXCLUDED.tunnel_count,
+                last_heartbeat = NOW(),
+                is_healthy = true
+            "#,
+        )
+        .bind(&self.server_id)
+        .bind(internal_addr)
+        .bind(tunnel_count)
+        .execute(&self.pool)
+        .await?;
+
+        debug!("Registered peer {} at {}", self.server_id, internal_addr);
+        Ok(())
+    }
+
+    /// Get all healthy peer servers.
+    pub async fn get_healthy_peers(&self, stale_threshold_secs: i64) -> Result<Vec<PeerRecord>> {
+        let records = sqlx::query_as::<_, PeerRecord>(
+            r#"
+            SELECT server_id, internal_addr, tunnel_count, last_heartbeat, is_healthy
+            FROM cluster_peers
+            WHERE is_healthy = true
+              AND server_id != $1
+              AND last_heartbeat > NOW() - INTERVAL '1 second' * $2
+            ORDER BY tunnel_count ASC
+            "#,
+        )
+        .bind(&self.server_id)
+        .bind(stale_threshold_secs)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Mark a peer as unhealthy.
+    pub async fn mark_peer_unhealthy(&self, peer_server_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE cluster_peers SET is_healthy = false WHERE server_id = $1
+            "#,
+        )
+        .bind(peer_server_id)
+        .execute(&self.pool)
+        .await?;
+
+        warn!("Marked peer {} as unhealthy", peer_server_id);
+        Ok(())
+    }
+
+    /// Find which server hosts a tunnel by subdomain.
+    pub async fn find_tunnel_server(&self, subdomain: &str) -> Result<Option<PeerRecord>> {
+        let record = sqlx::query_as::<_, PeerRecord>(
+            r#"
+            SELECT cp.server_id, cp.internal_addr, cp.tunnel_count, cp.last_heartbeat, cp.is_healthy
+            FROM tunnels t
+            JOIN cluster_peers cp ON t.server_id = cp.server_id
+            WHERE t.subdomain = $1 AND t.disconnected_at IS NULL AND cp.is_healthy = true
+            "#,
+        )
+        .bind(subdomain)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
+    /// Cleanup stale peer records.
+    pub async fn cleanup_stale_peers(&self, stale_threshold_secs: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE cluster_peers
+            SET is_healthy = false
+            WHERE last_heartbeat < NOW() - INTERVAL '1 second' * $1
+            "#,
+        )
+        .bind(stale_threshold_secs)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            info!("Marked {} stale peers as unhealthy", result.rows_affected());
+        }
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Remove this server from the peer list on shutdown.
+    pub async fn deregister_peer(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE cluster_peers SET is_healthy = false WHERE server_id = $1
+            "#,
+        )
+        .bind(&self.server_id)
+        .execute(&self.pool)
+        .await?;
+
+        info!("Deregistered peer {}", self.server_id);
+        Ok(())
+    }
+}
+
+/// A peer server record from the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PeerRecord {
+    pub server_id: String,
+    pub internal_addr: String,
+    pub tunnel_count: i32,
+    pub last_heartbeat: DateTime<Utc>,
+    pub is_healthy: bool,
 }
 
 #[cfg(test)]

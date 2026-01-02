@@ -3,13 +3,11 @@
 //! Allows multiple tunnel servers to work together by routing requests
 //! to the appropriate server when a tunnel is connected elsewhere.
 
+use crate::db::TunnelDb;
 use dashmap::DashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use tun_core::protocol::TunnelId;
 
 /// Information about a peer server in the cluster.
 #[derive(Debug, Clone)]
@@ -250,6 +248,175 @@ pub struct ClusterStats {
     /// Healthy peers.
     pub healthy_peers: usize,
     /// Cached tunnel locations.
+    pub cached_locations: usize,
+}
+
+/// Database-backed cluster coordinator for horizontal scaling.
+/// Uses PostgreSQL for peer discovery and tunnel location.
+pub struct DbClusterCoordinator {
+    /// This server's unique identifier.
+    pub server_id: String,
+    /// This server's internal address.
+    pub internal_addr: String,
+    /// Database connection.
+    db: Arc<TunnelDb>,
+    /// Local cache of tunnel locations.
+    tunnel_cache: DashMap<String, TunnelLocation>,
+    /// Cache TTL.
+    cache_ttl: Duration,
+    /// Peer heartbeat interval.
+    heartbeat_interval: Duration,
+    /// Stale peer threshold.
+    stale_threshold: Duration,
+}
+
+impl DbClusterCoordinator {
+    /// Create a new database-backed cluster coordinator.
+    pub fn new(server_id: &str, internal_addr: &str, db: Arc<TunnelDb>) -> Self {
+        info!(
+            "Initializing DB cluster coordinator for server '{}' at {}",
+            server_id, internal_addr
+        );
+        Self {
+            server_id: server_id.to_string(),
+            internal_addr: internal_addr.to_string(),
+            db,
+            tunnel_cache: DashMap::new(),
+            cache_ttl: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(10),
+            stale_threshold: Duration::from_secs(30),
+        }
+    }
+
+    /// Register this server with the cluster.
+    pub async fn register(&self, tunnel_count: i32) -> Result<(), String> {
+        self.db
+            .register_peer(&self.internal_addr, tunnel_count)
+            .await
+            .map_err(|e| format!("Failed to register peer: {}", e))
+    }
+
+    /// Deregister this server from the cluster.
+    pub async fn deregister(&self) -> Result<(), String> {
+        self.db
+            .deregister_peer()
+            .await
+            .map_err(|e| format!("Failed to deregister peer: {}", e))
+    }
+
+    /// Find which server hosts a tunnel.
+    pub async fn find_tunnel_server(&self, subdomain: &str) -> Option<String> {
+        // Check local cache first
+        if let Some(location) = self.tunnel_cache.get(subdomain) {
+            if location.updated_at.elapsed() < self.cache_ttl {
+                if location.server_id != self.server_id {
+                    return Some(location.server_addr.clone());
+                }
+                return None; // Local
+            }
+        }
+
+        // Query database
+        match self.db.find_tunnel_server(subdomain).await {
+            Ok(Some(peer)) => {
+                // Update cache
+                self.tunnel_cache.insert(
+                    subdomain.to_string(),
+                    TunnelLocation {
+                        server_id: peer.server_id.clone(),
+                        server_addr: peer.internal_addr.clone(),
+                        updated_at: Instant::now(),
+                    },
+                );
+
+                if peer.server_id != self.server_id {
+                    Some(peer.internal_addr)
+                } else {
+                    None // Local
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("Failed to find tunnel server for {}: {}", subdomain, e);
+                None
+            }
+        }
+    }
+
+    /// Get healthy peers for load balancing.
+    pub async fn get_healthy_peers(&self) -> Vec<crate::db::PeerRecord> {
+        match self
+            .db
+            .get_healthy_peers(self.stale_threshold.as_secs() as i64)
+            .await
+        {
+            Ok(peers) => peers,
+            Err(e) => {
+                warn!("Failed to get healthy peers: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Start the background peer sync task.
+    pub fn start_sync_task(
+        self: &Arc<Self>,
+        tunnel_count_fn: Arc<dyn Fn() -> i32 + Send + Sync>,
+    ) -> tokio::task::JoinHandle<()> {
+        let coordinator = Arc::clone(self);
+        let heartbeat_interval = self.heartbeat_interval;
+        let stale_threshold = self.stale_threshold;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            
+            loop {
+                interval.tick().await;
+                
+                // Update our heartbeat with current tunnel count
+                let tunnel_count = tunnel_count_fn();
+                if let Err(e) = coordinator.register(tunnel_count).await {
+                    error!("Failed to update peer heartbeat: {}", e);
+                }
+                
+                // Cleanup stale peers periodically (every 3rd heartbeat)
+                static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = 
+                    std::sync::atomic::AtomicU32::new(0);
+                let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % 3 == 0 {
+                    if let Err(e) = coordinator.db.cleanup_stale_peers(stale_threshold.as_secs() as i64).await {
+                        warn!("Failed to cleanup stale peers: {}", e);
+                    }
+                    
+                    // Also cleanup local cache
+                    coordinator.cleanup_cache();
+                }
+            }
+        })
+    }
+
+    /// Cleanup stale cache entries.
+    fn cleanup_cache(&self) {
+        let ttl = self.cache_ttl * 2;
+        self.tunnel_cache.retain(|_, v| v.updated_at.elapsed() < ttl);
+    }
+
+    /// Get cluster statistics.
+    pub async fn stats(&self) -> DbClusterStats {
+        let healthy_peers = self.get_healthy_peers().await;
+        DbClusterStats {
+            server_id: self.server_id.clone(),
+            healthy_peer_count: healthy_peers.len(),
+            cached_locations: self.tunnel_cache.len(),
+        }
+    }
+}
+
+/// Database cluster statistics.
+#[derive(Debug, Clone)]
+pub struct DbClusterStats {
+    pub server_id: String,
+    pub healthy_peer_count: usize,
     pub cached_locations: usize,
 }
 
