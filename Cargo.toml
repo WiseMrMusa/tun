@@ -47,8 +47,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Distributed Tracing
 opentelemetry = "0.21"
 opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.14", features = ["tonic"] }
+opentelemetry-otlp = { version = "0.14", features = ["tonic", "http-proto"] }
 tracing-opentelemetry = "0.22"
+tonic = "0.9"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }

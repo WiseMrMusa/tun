@@ -1,17 +1,31 @@
 //! OpenTelemetry distributed tracing support.
 //!
 //! Provides request tracing across the tunnel system using OpenTelemetry.
-//! Supports OTLP export for integration with observability backends.
+//! Supports OTLP export for integration with observability backends like Jaeger,
+//! Zipkin, Honeycomb, Datadog, etc.
 
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::trace::Sampler;
+use opentelemetry_sdk::Resource;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
-use tracing::{info, span, Level, Span};
+use tracing::{info, span, warn, Level, Span};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use uuid::Uuid;
+
+/// Global tracer provider for shutdown handling.
+static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::TracerProvider> = OnceLock::new();
 
 /// Configuration for OTLP exporter.
 #[derive(Debug, Clone)]
 pub struct OtlpConfig {
-    /// OTLP endpoint URL (e.g., "http://localhost:4317")
+    /// OTLP endpoint URL (e.g., "http://localhost:4317" for gRPC or "http://localhost:4318/v1/traces" for HTTP)
     pub endpoint: String,
     /// Service name to report.
     pub service_name: String,
@@ -21,6 +35,10 @@ pub struct OtlpConfig {
     pub timeout: Duration,
     /// Batch size for exporting spans.
     pub batch_size: usize,
+    /// Sample rate (0.0 - 1.0). Default is 1.0 (sample everything).
+    pub sample_rate: f64,
+    /// Whether to use gRPC (true) or HTTP (false) protocol.
+    pub use_grpc: bool,
 }
 
 impl Default for OtlpConfig {
@@ -31,6 +49,8 @@ impl Default for OtlpConfig {
             api_key: None,
             timeout: Duration::from_secs(10),
             batch_size: 512,
+            sample_rate: 1.0,
+            use_grpc: true,
         }
     }
 }
@@ -50,7 +70,154 @@ impl OtlpConfig {
         self.api_key = Some(api_key.to_string());
         self
     }
+
+    /// Set the sample rate.
+    pub fn with_sample_rate(mut self, rate: f64) -> Self {
+        self.sample_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Use HTTP protocol instead of gRPC.
+    pub fn with_http(mut self) -> Self {
+        self.use_grpc = false;
+        self
+    }
 }
+
+/// Initialize OpenTelemetry tracing with OTLP export.
+///
+/// This function sets up:
+/// - A tracer provider with batch span processing
+/// - OTLP exporter (gRPC or HTTP based on config)
+/// - tracing-subscriber integration via tracing-opentelemetry
+///
+/// Returns an error if initialization fails.
+pub fn init_otel_tracing(config: &OtlpConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Build resource with service information
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", config.service_name.clone()),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ]);
+
+    // Configure sampler
+    let sampler = if config.sample_rate >= 1.0 {
+        Sampler::AlwaysOn
+    } else if config.sample_rate <= 0.0 {
+        Sampler::AlwaysOff
+    } else {
+        Sampler::TraceIdRatioBased(config.sample_rate)
+    };
+
+    // Build the tracer provider with OTLP exporter
+    let tracer_provider = if config.use_grpc {
+        // gRPC exporter
+        let mut exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(&config.endpoint)
+            .with_timeout(config.timeout);
+
+        // Add authorization header if API key provided
+        if let Some(ref api_key) = config.api_key {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            metadata.insert(
+                "authorization",
+                format!("Bearer {}", api_key).parse().unwrap(),
+            );
+            exporter = exporter.with_metadata(metadata);
+        }
+
+        opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_config(
+                opentelemetry_sdk::trace::config()
+                    .with_sampler(sampler)
+                    .with_resource(resource),
+            )
+            .with_batch_exporter(exporter.build_span_exporter()?, Tokio)
+            .build()
+    } else {
+        // HTTP exporter
+        let mut exporter = opentelemetry_otlp::new_exporter()
+            .http()
+            .with_endpoint(&config.endpoint)
+            .with_timeout(config.timeout);
+
+        // Add authorization header if API key provided
+        if let Some(ref api_key) = config.api_key {
+            let mut headers = HashMap::new();
+            headers.insert("Authorization".to_string(), format!("Bearer {}", api_key));
+            exporter = exporter.with_headers(headers);
+        }
+
+        opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_config(
+                opentelemetry_sdk::trace::config()
+                    .with_sampler(sampler)
+                    .with_resource(resource),
+            )
+            .with_batch_exporter(exporter.build_span_exporter()?, Tokio)
+            .build()
+    };
+
+    // Store for shutdown
+    let _ = TRACER_PROVIDER.set(tracer_provider.clone());
+
+    // Get tracer
+    let tracer = tracer_provider.tracer("tun-server");
+
+    // Create OpenTelemetry tracing layer
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    // Install subscriber with both fmt (console) and OpenTelemetry layers
+    tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            ),
+        )
+        .init();
+
+    info!(
+        endpoint = %config.endpoint,
+        service = %config.service_name,
+        sample_rate = %config.sample_rate,
+        protocol = if config.use_grpc { "gRPC" } else { "HTTP" },
+        "OpenTelemetry OTLP tracing initialized"
+    );
+
+    Ok(())
+}
+
+/// Initialize basic logging without OTLP (fallback).
+pub fn init_basic_logging(debug: bool) {
+    let level = if debug { Level::DEBUG } else { Level::INFO };
+
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(true)
+        .with_thread_ids(true)
+        .init();
+}
+
+/// Shutdown OpenTelemetry and flush pending spans.
+pub fn shutdown_otel() {
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        info!("Shutting down OpenTelemetry tracer, flushing pending spans...");
+        // force_flush returns Vec<Result<(), TraceError>> - check if any failed
+        let results = provider.force_flush();
+        for result in results {
+            if let Err(e) = result {
+                warn!("Error flushing OpenTelemetry span: {:?}", e);
+            }
+        }
+        info!("OpenTelemetry shutdown complete");
+    }
+}
+
+// ============================================================================
+// Manual Span Collector (for custom span management)
+// ============================================================================
 
 /// A span ready for export to OTLP.
 #[derive(Debug, Clone)]
@@ -163,88 +330,9 @@ impl ExportableSpan {
     }
 }
 
-/// Collector for spans to be exported.
-pub struct SpanCollector {
-    config: OtlpConfig,
-    spans: tokio::sync::Mutex<Vec<ExportableSpan>>,
-}
-
-impl SpanCollector {
-    /// Create a new span collector.
-    pub fn new(config: OtlpConfig) -> Self {
-        Self {
-            config,
-            spans: tokio::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Record a completed span.
-    pub async fn record(&self, span: ExportableSpan) {
-        let mut spans = self.spans.lock().await;
-        spans.push(span);
-
-        // Auto-flush if batch is full
-        if spans.len() >= self.config.batch_size {
-            let batch = std::mem::take(&mut *spans);
-            drop(spans); // Release lock before async export
-            self.export_batch(batch).await;
-        }
-    }
-
-    /// Flush all pending spans.
-    pub async fn flush(&self) {
-        let batch = {
-            let mut spans = self.spans.lock().await;
-            std::mem::take(&mut *spans)
-        };
-
-        if !batch.is_empty() {
-            self.export_batch(batch).await;
-        }
-    }
-
-    /// Export a batch of spans to OTLP endpoint.
-    async fn export_batch(&self, spans: Vec<ExportableSpan>) {
-        // In a real implementation, this would serialize to OTLP protobuf and POST to the endpoint.
-        // For now, we log the spans for demonstration.
-        info!(
-            "Exporting {} spans to {} (service: {})",
-            spans.len(),
-            self.config.endpoint,
-            self.config.service_name
-        );
-
-        for span in &spans {
-            tracing::debug!(
-                trace_id = %span.trace_id,
-                span_id = %span.span_id,
-                parent_span_id = ?span.parent_span_id,
-                operation = %span.operation_name,
-                duration_ms = ?span.duration_ms(),
-                status = ?span.status,
-                "exported_span"
-            );
-        }
-
-        // TODO: Implement actual OTLP export using reqwest or tonic
-        // This would involve:
-        // 1. Converting spans to OTLP protobuf format
-        // 2. POSTing to self.config.endpoint with appropriate headers
-        // 3. Handling retries and errors
-    }
-
-    /// Start the background export task.
-    pub fn start_export_task(self: &std::sync::Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
-        let collector = std::sync::Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                collector.flush().await;
-            }
-        })
-    }
-}
+// ============================================================================
+// Trace Context (W3C Trace Context propagation)
+// ============================================================================
 
 /// Trace context for distributed tracing.
 #[derive(Debug, Clone)]
@@ -507,5 +595,18 @@ mod tests {
         assert!(header.contains("user_id=123"));
         assert!(header.contains("tenant=acme"));
     }
-}
 
+    #[test]
+    fn test_otlp_config() {
+        let config = OtlpConfig::new("http://localhost:4317", "test-service")
+            .with_api_key("secret")
+            .with_sample_rate(0.5)
+            .with_http();
+
+        assert_eq!(config.endpoint, "http://localhost:4317");
+        assert_eq!(config.service_name, "test-service");
+        assert_eq!(config.api_key, Some("secret".to_string()));
+        assert_eq!(config.sample_rate, 0.5);
+        assert!(!config.use_grpc);
+    }
+}
