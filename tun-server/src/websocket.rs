@@ -134,13 +134,20 @@ impl SubprotocolConfig {
 
 /// State for handling continuation frames.
 #[derive(Debug, Default)]
-struct ContinuationState {
+pub struct ContinuationState {
     /// Accumulated payload for multi-frame messages.
     buffer: Vec<u8>,
     /// Original opcode of the fragmented message.
     original_opcode: Option<WebSocketOpcode>,
     /// Whether we're currently in a continuation sequence.
     in_continuation: bool,
+}
+
+impl ContinuationState {
+    /// Create a new continuation state.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl ContinuationState {
@@ -422,6 +429,127 @@ pub fn fragment_frame(
     );
 
     fragments
+}
+
+/// Handle bidirectional WebSocket relay between a public client and a tunnel.
+/// 
+/// This function manages the full lifecycle of a WebSocket connection, including:
+/// - Receiving frames from the public client and forwarding to the tunnel
+/// - Receiving frames from the tunnel and forwarding to the public client
+/// - Handling continuation frames (fragmented messages)
+/// - Compression negotiation (via config)
+pub async fn handle_websocket_relay(
+    mut ws: axum::extract::ws::WebSocket,
+    request_id: RequestId,
+    ws_manager: Arc<WebSocketManager>,
+    to_tunnel_tx: mpsc::Sender<WebSocketFrameData>,
+    compression_config: Option<WebSocketCompressionConfig>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use crate::metrics;
+
+    info!("Starting WebSocket relay for request {}", request_id);
+
+    // Register this session with the manager
+    let mut from_tunnel_rx = ws_manager.register_session(request_id);
+
+    // Track compression state
+    let _compression = compression_config.unwrap_or_else(WebSocketCompressionConfig::none);
+
+    // Continuation state for assembling fragmented messages
+    let mut continuation_state = ContinuationState::new();
+
+    // Split the WebSocket into sender and receiver
+    let (mut ws_sender, mut ws_receiver) = ws.split();
+
+    // Spawn task to forward frames from tunnel to client
+    let ws_manager_clone = ws_manager.clone();
+    let tunnel_to_client = tokio::spawn(async move {
+        while let Some(frame) = from_tunnel_rx.recv().await {
+            let msg = frame_to_ws_message(frame);
+            if let Err(e) = ws_sender.send(msg).await {
+                debug!("Failed to send frame to client: {}", e);
+                break;
+            }
+            metrics::record_websocket_frame("outbound", 0);
+        }
+        debug!("Tunnel-to-client relay ended for request {}", request_id);
+    });
+
+    // Handle frames from client to tunnel
+    while let Some(msg_result) = ws_receiver.next().await {
+        match msg_result {
+            Ok(msg) => {
+                // Convert to our frame format
+                if let Some(frame) = ws_message_to_frame(&msg) {
+                    let bytes = frame.payload.len();
+                    
+                    // Handle continuation frames
+                    let complete_frame = handle_frame_with_continuation(frame, &mut continuation_state);
+                    
+                    if let Some(frame_to_send) = complete_frame {
+                        // Check for close frame
+                        if matches!(frame_to_send.opcode, WebSocketOpcode::Close) {
+                            info!("Client sent close frame for request {}", request_id);
+                            let _ = to_tunnel_tx.send(frame_to_send).await;
+                            break;
+                        }
+                        
+                        // Forward to tunnel
+                        if let Err(e) = to_tunnel_tx.send(frame_to_send).await {
+                            warn!("Failed to forward frame to tunnel: {}", e);
+                            break;
+                        }
+                        metrics::record_websocket_frame("inbound", bytes);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("WebSocket receive error for request {}: {}", request_id, e);
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    tunnel_to_client.abort();
+    ws_manager_clone.unregister_session(request_id);
+    info!("WebSocket relay ended for request {}", request_id);
+}
+
+/// Negotiate WebSocket compression from request headers.
+/// Returns the compression config to use and the response extension header.
+pub fn negotiate_compression(
+    request_extensions: Option<&str>,
+    server_config: &WebSocketCompressionConfig,
+) -> (WebSocketCompressionConfig, Option<String>) {
+    if !server_config.permessage_deflate {
+        return (WebSocketCompressionConfig::none(), None);
+    }
+
+    match request_extensions {
+        Some(ext) if ext.contains("permessage-deflate") => {
+            // Client supports compression, negotiate parameters
+            let config = WebSocketCompressionConfig::from_extension_header(ext);
+            let response_ext = config.to_extension_header();
+            (config, response_ext)
+        }
+        _ => {
+            // Client doesn't support compression
+            (WebSocketCompressionConfig::none(), None)
+        }
+    }
+}
+
+/// Negotiate WebSocket subprotocol from request headers.
+pub fn negotiate_subprotocol(
+    request_protocols: Option<&str>,
+    server_config: &SubprotocolConfig,
+) -> Option<String> {
+    request_protocols.and_then(|header| {
+        let client_protos: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
+        server_config.negotiate(&client_protos)
+    })
 }
 
 #[cfg(test)]
