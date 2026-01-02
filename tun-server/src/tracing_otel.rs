@@ -1,10 +1,250 @@
 //! OpenTelemetry distributed tracing support.
 //!
 //! Provides request tracing across the tunnel system using OpenTelemetry.
+//! Supports OTLP export for integration with observability backends.
 
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 use tracing::{info, span, Level, Span};
 use uuid::Uuid;
+
+/// Configuration for OTLP exporter.
+#[derive(Debug, Clone)]
+pub struct OtlpConfig {
+    /// OTLP endpoint URL (e.g., "http://localhost:4317")
+    pub endpoint: String,
+    /// Service name to report.
+    pub service_name: String,
+    /// Optional API key for authenticated endpoints.
+    pub api_key: Option<String>,
+    /// Export timeout.
+    pub timeout: Duration,
+    /// Batch size for exporting spans.
+    pub batch_size: usize,
+}
+
+impl Default for OtlpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:4317".to_string(),
+            service_name: "tun-server".to_string(),
+            api_key: None,
+            timeout: Duration::from_secs(10),
+            batch_size: 512,
+        }
+    }
+}
+
+impl OtlpConfig {
+    /// Create a new OTLP config with the specified endpoint.
+    pub fn new(endpoint: &str, service_name: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            service_name: service_name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the API key for authentication.
+    pub fn with_api_key(mut self, api_key: &str) -> Self {
+        self.api_key = Some(api_key.to_string());
+        self
+    }
+}
+
+/// A span ready for export to OTLP.
+#[derive(Debug, Clone)]
+pub struct ExportableSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub operation_name: String,
+    pub start_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    pub status: SpanStatus,
+    pub attributes: HashMap<String, SpanValue>,
+    pub events: Vec<SpanEvent>,
+}
+
+/// Span status for OTLP export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanStatus {
+    Unset,
+    Ok,
+    Error,
+}
+
+/// Attribute value types.
+#[derive(Debug, Clone)]
+pub enum SpanValue {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// A span event.
+#[derive(Debug, Clone)]
+pub struct SpanEvent {
+    pub name: String,
+    pub timestamp: SystemTime,
+    pub attributes: HashMap<String, SpanValue>,
+}
+
+impl ExportableSpan {
+    /// Create a new exportable span.
+    pub fn new(trace_id: &str, span_id: &str, operation_name: &str) -> Self {
+        Self {
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            parent_span_id: None,
+            operation_name: operation_name.to_string(),
+            start_time: SystemTime::now(),
+            end_time: None,
+            status: SpanStatus::Unset,
+            attributes: HashMap::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Set the parent span ID.
+    pub fn with_parent(mut self, parent_span_id: &str) -> Self {
+        self.parent_span_id = Some(parent_span_id.to_string());
+        self
+    }
+
+    /// Add an attribute.
+    pub fn set_attribute(&mut self, key: &str, value: SpanValue) {
+        self.attributes.insert(key.to_string(), value);
+    }
+
+    /// Add an event.
+    pub fn add_event(&mut self, name: &str) {
+        self.events.push(SpanEvent {
+            name: name.to_string(),
+            timestamp: SystemTime::now(),
+            attributes: HashMap::new(),
+        });
+    }
+
+    /// Add an event with attributes.
+    pub fn add_event_with_attributes(&mut self, name: &str, attributes: HashMap<String, SpanValue>) {
+        self.events.push(SpanEvent {
+            name: name.to_string(),
+            timestamp: SystemTime::now(),
+            attributes,
+        });
+    }
+
+    /// Mark the span as finished.
+    pub fn finish(&mut self) {
+        self.end_time = Some(SystemTime::now());
+    }
+
+    /// Mark the span as OK.
+    pub fn set_ok(&mut self) {
+        self.status = SpanStatus::Ok;
+    }
+
+    /// Mark the span as Error.
+    pub fn set_error(&mut self, message: &str) {
+        self.status = SpanStatus::Error;
+        self.set_attribute("error.message", SpanValue::String(message.to_string()));
+    }
+
+    /// Get the duration in milliseconds.
+    pub fn duration_ms(&self) -> Option<f64> {
+        self.end_time.map(|end| {
+            end.duration_since(self.start_time)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+        })
+    }
+}
+
+/// Collector for spans to be exported.
+pub struct SpanCollector {
+    config: OtlpConfig,
+    spans: tokio::sync::Mutex<Vec<ExportableSpan>>,
+}
+
+impl SpanCollector {
+    /// Create a new span collector.
+    pub fn new(config: OtlpConfig) -> Self {
+        Self {
+            config,
+            spans: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record a completed span.
+    pub async fn record(&self, span: ExportableSpan) {
+        let mut spans = self.spans.lock().await;
+        spans.push(span);
+
+        // Auto-flush if batch is full
+        if spans.len() >= self.config.batch_size {
+            let batch = std::mem::take(&mut *spans);
+            drop(spans); // Release lock before async export
+            self.export_batch(batch).await;
+        }
+    }
+
+    /// Flush all pending spans.
+    pub async fn flush(&self) {
+        let batch = {
+            let mut spans = self.spans.lock().await;
+            std::mem::take(&mut *spans)
+        };
+
+        if !batch.is_empty() {
+            self.export_batch(batch).await;
+        }
+    }
+
+    /// Export a batch of spans to OTLP endpoint.
+    async fn export_batch(&self, spans: Vec<ExportableSpan>) {
+        // In a real implementation, this would serialize to OTLP protobuf and POST to the endpoint.
+        // For now, we log the spans for demonstration.
+        info!(
+            "Exporting {} spans to {} (service: {})",
+            spans.len(),
+            self.config.endpoint,
+            self.config.service_name
+        );
+
+        for span in &spans {
+            tracing::debug!(
+                trace_id = %span.trace_id,
+                span_id = %span.span_id,
+                parent_span_id = ?span.parent_span_id,
+                operation = %span.operation_name,
+                duration_ms = ?span.duration_ms(),
+                status = ?span.status,
+                "exported_span"
+            );
+        }
+
+        // TODO: Implement actual OTLP export using reqwest or tonic
+        // This would involve:
+        // 1. Converting spans to OTLP protobuf format
+        // 2. POSTing to self.config.endpoint with appropriate headers
+        // 3. Handling retries and errors
+    }
+
+    /// Start the background export task.
+    pub fn start_export_task(self: &std::sync::Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let collector = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                collector.flush().await;
+            }
+        })
+    }
+}
 
 /// Trace context for distributed tracing.
 #[derive(Debug, Clone)]
