@@ -5,8 +5,12 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Timelike, Utc};
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use tun_core::protocol::TunnelId;
 use uuid::Uuid;
@@ -29,6 +33,12 @@ impl DbConfig {
             max_connections: 10,
             server_id,
         }
+    }
+
+    /// Create a new config with a custom max connections value.
+    pub fn with_max_connections(mut self, max_connections: u32) -> Self {
+        self.max_connections = max_connections;
+        self
     }
 }
 
@@ -76,11 +86,99 @@ impl AuditEventType {
     }
 }
 
+/// Default revocation cache TTL: 60 seconds
+const DEFAULT_REVOCATION_CACHE_TTL_SECS: u64 = 60;
+
+/// Default revocation cache capacity
+const DEFAULT_REVOCATION_CACHE_CAPACITY: usize = 10_000;
+
+/// Cache entry for token revocation status.
+struct RevocationCacheEntry {
+    /// Whether the token is revoked
+    is_revoked: bool,
+    /// When this entry was cached
+    cached_at: Instant,
+}
+
+/// LRU cache for token revocation lookups to avoid database hits on every request.
+pub struct RevocationCache {
+    cache: Mutex<LruCache<String, RevocationCacheEntry>>,
+    ttl: Duration,
+}
+
+impl RevocationCache {
+    /// Create a new revocation cache with default settings.
+    pub fn new() -> Self {
+        Self::with_capacity_and_ttl(
+            DEFAULT_REVOCATION_CACHE_CAPACITY,
+            Duration::from_secs(DEFAULT_REVOCATION_CACHE_TTL_SECS),
+        )
+    }
+
+    /// Create a new revocation cache with custom capacity and TTL.
+    pub fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            cache: Mutex::new(LruCache::new(capacity)),
+            ttl,
+        }
+    }
+
+    /// Get a cached revocation status if present and not expired.
+    pub fn get(&self, token_id: &str) -> Option<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(entry) = cache.get(token_id) {
+            if entry.cached_at.elapsed() < self.ttl {
+                return Some(entry.is_revoked);
+            }
+            // Entry expired, remove it
+            cache.pop(token_id);
+        }
+        None
+    }
+
+    /// Cache a revocation status.
+    pub fn set(&self, token_id: &str, is_revoked: bool) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.put(
+            token_id.to_string(),
+            RevocationCacheEntry {
+                is_revoked,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Invalidate a cache entry (e.g., after revocation or unrevocation).
+    pub fn invalidate(&self, token_id: &str) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pop(token_id);
+    }
+
+    /// Get cache statistics.
+    pub fn len(&self) -> usize {
+        self.cache.lock().unwrap().len()
+    }
+
+    /// Check if cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for RevocationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Database layer for tunnel operations
 #[derive(Clone)]
 pub struct TunnelDb {
     pool: PgPool,
     server_id: String,
+    /// Cache for token revocation lookups
+    revocation_cache: std::sync::Arc<RevocationCache>,
 }
 
 impl TunnelDb {
@@ -98,6 +196,7 @@ impl TunnelDb {
         Ok(Self {
             pool,
             server_id: config.server_id.clone(),
+            revocation_cache: std::sync::Arc::new(RevocationCache::new()),
         })
     }
 
@@ -354,7 +453,7 @@ impl TunnelDb {
             r#"
             INSERT INTO request_stats (tunnel_id, period_start, period_end, request_count, bytes_in, bytes_out, error_count, avg_latency_ms)
             VALUES ($1, $2, $3, 1, $4, $5, $6, $7)
-            ON CONFLICT ON CONSTRAINT request_stats_pkey DO UPDATE SET
+            ON CONFLICT (tunnel_id, period_start) DO UPDATE SET
                 request_count = request_stats.request_count + 1,
                 bytes_in = request_stats.bytes_in + EXCLUDED.bytes_in,
                 bytes_out = request_stats.bytes_out + EXCLUDED.bytes_out,
@@ -436,6 +535,9 @@ impl TunnelDb {
         .execute(&self.pool)
         .await?;
 
+        // Invalidate cache entry
+        self.revocation_cache.invalidate(token_id);
+
         info!("Token {} revoked", token_id);
         self.log_audit_event(
             None,
@@ -448,7 +550,8 @@ impl TunnelDb {
         Ok(())
     }
 
-    /// Check if a token is revoked.
+    /// Check if a token is revoked (without cache).
+    /// Prefer `is_token_revoked_cached` for performance.
     pub async fn is_token_revoked(&self, token_id: &str) -> Result<bool> {
         let result: Option<(i64,)> = sqlx::query_as(
             r#"
@@ -460,6 +563,25 @@ impl TunnelDb {
         .await?;
 
         Ok(result.map(|(count,)| count > 0).unwrap_or(false))
+    }
+
+    /// Check if a token is revoked with caching.
+    /// Uses an LRU cache with TTL to avoid database hits on every request.
+    pub async fn is_token_revoked_cached(&self, token_id: &str) -> Result<bool> {
+        // Check cache first
+        if let Some(is_revoked) = self.revocation_cache.get(token_id) {
+            debug!("Revocation cache hit for token {}: {}", token_id, is_revoked);
+            return Ok(is_revoked);
+        }
+
+        // Cache miss - query database
+        let is_revoked = self.is_token_revoked(token_id).await?;
+        
+        // Update cache
+        self.revocation_cache.set(token_id, is_revoked);
+        debug!("Revocation cache miss for token {}: {} (now cached)", token_id, is_revoked);
+
+        Ok(is_revoked)
     }
 
     /// Unrevoke a token (remove from revocation list).
@@ -474,6 +596,8 @@ impl TunnelDb {
         .await?;
 
         if result.rows_affected() > 0 {
+            // Invalidate cache entry
+            self.revocation_cache.invalidate(token_id);
             info!("Token {} unrevoked", token_id);
         }
 
