@@ -111,10 +111,16 @@ async fn main() -> Result<()> {
     // Initialize ACL manager
     let acl_manager = Arc::new(RwLock::new(AclManager::new()));
 
-    // Load ACL config if specified
+    // Load ACL config if specified - initial load before hot reload watcher
     if let Some(ref acl_path) = config.acl_config_file {
-        info!("Loading ACL configuration from {}", acl_path);
-        // ACL loading is handled by hot reload
+        match hotreload::reload_acl_config(&acl_manager, Some(&PathBuf::from(acl_path))).await {
+            Ok(()) => {
+                info!("Loaded initial ACL configuration from {}", acl_path);
+            }
+            Err(e) => {
+                warn!("Failed to load initial ACL config: {}", e);
+            }
+        }
     }
 
     // Create shared rate limiter
@@ -316,12 +322,11 @@ async fn main() -> Result<()> {
 
     // Start the API and dashboard server if configured
     let api_handle = if let Some(api_port) = config.api_port {
-        let api_state = ApiState {
-            registry: state.clone(),
-            rate_limiter: rate_limiter.clone(),
-            start_time: Instant::now(),
-            api_key: config.api_key.clone(),
-        };
+        let api_state = ApiState::new(
+            state.clone(),
+            rate_limiter.clone(),
+            config.api_key.clone(),
+        );
 
         if config.api_key.is_some() {
             info!("API authentication enabled (admin endpoints require API key)");
