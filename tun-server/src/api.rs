@@ -119,6 +119,7 @@ impl ApiState {
 }
 
 /// Create the API router with authentication for admin endpoints.
+/// When no API key is configured, admin endpoints are disabled entirely.
 pub fn create_api_router(state: ApiState) -> Router {
     // Public routes (no auth required)
     let public_routes = Router::new()
@@ -131,25 +132,32 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/api/tunnels", get(list_tunnels_handler))
         .route("/api/tunnels/:subdomain", get(get_tunnel_handler));
 
-    // Admin routes (require API key authentication)
-    let admin_routes = Router::new()
-        .route(
-            "/api/tunnels/:subdomain/disconnect",
-            post(disconnect_tunnel_handler),
-        )
-        .route("/api/tokens/:token_id/revoke", post(revoke_token_handler))
-        .route("/api/tokens/:token_id/unrevoke", post(unrevoke_token_handler))
-        // Rate limit management
-        .route("/api/ratelimits", get(list_rate_limits_handler))
-        .route("/api/ratelimits/:subdomain", get(get_subdomain_rate_limit_handler))
-        .route("/api/ratelimits/:subdomain", post(set_subdomain_rate_limit_handler))
-        .route("/api/ratelimits/:subdomain", axum::routing::delete(delete_subdomain_rate_limit_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    // Only include admin routes if API key is configured
+    if state.api_key.is_some() {
+        // Admin routes (require API key authentication)
+        let admin_routes = Router::new()
+            .route(
+                "/api/tunnels/:subdomain/disconnect",
+                post(disconnect_tunnel_handler),
+            )
+            .route("/api/tokens/:token_id/revoke", post(revoke_token_handler))
+            .route("/api/tokens/:token_id/unrevoke", post(unrevoke_token_handler))
+            // Rate limit management
+            .route("/api/ratelimits", get(list_rate_limits_handler))
+            .route("/api/ratelimits/:subdomain", get(get_subdomain_rate_limit_handler))
+            .route("/api/ratelimits/:subdomain", post(set_subdomain_rate_limit_handler))
+            .route("/api/ratelimits/:subdomain", axum::routing::delete(delete_subdomain_rate_limit_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), require_api_key));
 
-    Router::new()
-        .merge(public_routes)
-        .merge(admin_routes)
-        .with_state(state)
+        info!("Admin API endpoints enabled (API key authentication required)");
+        Router::new()
+            .merge(public_routes)
+            .merge(admin_routes)
+            .with_state(state)
+    } else {
+        warn!("Admin API endpoints DISABLED (no API key configured). Set TUN_API_KEY to enable.");
+        public_routes.with_state(state)
+    }
 }
 
 /// Middleware to require API key authentication.
