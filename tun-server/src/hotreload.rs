@@ -280,7 +280,9 @@ async fn reload_ip_filter(
 }
 
 /// Reload the ACL configuration from a YAML file.
-async fn reload_acl_config(
+/// Load ACL configuration from a file.
+/// This function can be called during startup or hot reload.
+pub async fn reload_acl_config(
     acl_manager: &Arc<tokio::sync::RwLock<AclManager>>,
     acl_config_path: Option<&PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -314,14 +316,14 @@ async fn reload_acl_config(
 
 /// Structure for parsing ACL YAML configuration file.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct AclFileConfig {
+pub struct AclFileConfig {
     #[serde(default)]
     subdomains: Vec<SubdomainConfig>,
 }
 
 /// Per-subdomain configuration from YAML.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct SubdomainConfig {
+pub struct SubdomainConfig {
     subdomain: String,
     enabled: Option<bool>,
     ip_allowlist: Option<Vec<String>>,
