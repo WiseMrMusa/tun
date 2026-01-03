@@ -1,0 +1,279 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_suffix: ''
+            archive_ext: tar.gz
+            use_cross: false
+
+          # Linux ARM64
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_suffix: ''
+            archive_ext: tar.gz
+            use_cross: true
+
+          # macOS x86_64
+          - name: darwin-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary_suffix: ''
+            archive_ext: tar.gz
+            use_cross: false
+
+          # macOS ARM64 (Apple Silicon)
+          - name: darwin-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary_suffix: ''
+            archive_ext: tar.gz
+            use_cross: false
+
+          # Windows x86_64
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_suffix: '.exe'
+            archive_ext: zip
+            use_cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binaries (native)
+        if: '!matrix.use_cross'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release binaries (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Prepare release directory (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          RELEASE_DIR="tun-${VERSION}-${{ matrix.name }}"
+          mkdir -p "$RELEASE_DIR"
+          
+          # Copy binaries
+          cp "target/${{ matrix.target }}/release/tun-server${{ matrix.binary_suffix }}" "$RELEASE_DIR/"
+          cp "target/${{ matrix.target }}/release/tun-client${{ matrix.binary_suffix }}" "$RELEASE_DIR/"
+          cp "target/${{ matrix.target }}/release/tun-token${{ matrix.binary_suffix }}" "$RELEASE_DIR/"
+          
+          # Copy documentation
+          cp README.md "$RELEASE_DIR/"
+          
+          # Create archive
+          tar -czvf "${RELEASE_DIR}.${{ matrix.archive_ext }}" "$RELEASE_DIR"
+          
+          echo "ASSET_PATH=${RELEASE_DIR}.${{ matrix.archive_ext }}" >> $GITHUB_ENV
+          echo "ASSET_NAME=${RELEASE_DIR}.${{ matrix.archive_ext }}" >> $GITHUB_ENV
+
+      - name: Prepare release directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          $RELEASE_DIR = "tun-${VERSION}-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $RELEASE_DIR
+          
+          # Copy binaries
+          Copy-Item "target/${{ matrix.target }}/release/tun-server${{ matrix.binary_suffix }}" $RELEASE_DIR/
+          Copy-Item "target/${{ matrix.target }}/release/tun-client${{ matrix.binary_suffix }}" $RELEASE_DIR/
+          Copy-Item "target/${{ matrix.target }}/release/tun-token${{ matrix.binary_suffix }}" $RELEASE_DIR/
+          
+          # Copy documentation
+          Copy-Item README.md $RELEASE_DIR/
+          
+          # Create archive
+          Compress-Archive -Path $RELEASE_DIR -DestinationPath "${RELEASE_DIR}.${{ matrix.archive_ext }}"
+          
+          echo "ASSET_PATH=${RELEASE_DIR}.${{ matrix.archive_ext }}" >> $env:GITHUB_ENV
+          echo "ASSET_NAME=${RELEASE_DIR}.${{ matrix.archive_ext }}" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_PATH }}
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Build and push Docker images
+  docker:
+    name: Build Docker Images
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download Linux x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tun-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+          path: docker/
+
+      - name: Download Linux ARM64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tun-${{ steps.version.outputs.version }}-linux-arm64.tar.gz
+          path: docker/
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract binaries
+        run: |
+          cd docker
+          for f in *.tar.gz; do tar -xzf "$f"; done
+          ls -la
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/tun-server:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}/tun-server:latest
+
+      - name: Build and push client image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.client
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/tun-client:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}/tun-client:latest
+

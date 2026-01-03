@@ -1,0 +1,71 @@
+# Cargo configuration for tun project
+# Includes release optimizations and cross-compilation settings
+
+# =============================================================================
+# Release Profile Optimizations
+# =============================================================================
+
+[profile.release]
+# Enable Link-Time Optimization for smaller, faster binaries
+lto = "thin"
+# Single codegen unit for better optimization (slower compile, faster binary)
+codegen-units = 1
+# Strip symbols for smaller binaries
+strip = true
+# Optimize for size with good performance
+opt-level = 3
+# Enable panic=abort for smaller binaries (no unwinding)
+panic = "abort"
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
+
+# =============================================================================
+# Target-Specific Settings
+# =============================================================================
+
+# Linux x86_64
+[target.x86_64-unknown-linux-gnu]
+# Use cross linker when cross-compiling from non-Linux
+
+# Linux ARM64
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# macOS x86_64
+[target.x86_64-apple-darwin]
+# Native on macOS Intel
+
+# macOS ARM64 (Apple Silicon)
+[target.aarch64-apple-darwin]
+# Native on macOS ARM
+
+# Windows x86_64
+[target.x86_64-pc-windows-msvc]
+# Uses MSVC toolchain
+
+# Windows x86_64 (GNU toolchain for cross-compilation)
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+# =============================================================================
+# Build Settings
+# =============================================================================
+
+[build]
+# Incremental compilation for faster dev builds
+incremental = true
+
+[net]
+# Use git CLI for fetching (more reliable behind corporate firewalls)
+git-fetch-with-cli = true
+
+# =============================================================================
+# Registries
+# =============================================================================
+
+[registries.crates-io]
+protocol = "sparse"
+

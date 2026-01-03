@@ -1,0 +1,29 @@
+# Multi-platform Dockerfile for tun-client
+# Builds from pre-compiled binaries
+
+FROM debian:bookworm-slim
+
+ARG TARGETPLATFORM
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the appropriate binary based on platform
+COPY docker/tun-*-linux-*/tun-client /usr/local/bin/tun-client
+
+# Ensure binary is executable
+RUN chmod +x /usr/local/bin/tun-client
+
+# Create non-root user
+RUN useradd -r -s /bin/false tun
+USER tun
+
+# Set default environment variables
+ENV TUN_SERVER=localhost:8080 \
+    TUN_LOCAL_HOST=host.docker.internal \
+    RUST_LOG=info
+
+ENTRYPOINT ["tun-client"]
+
