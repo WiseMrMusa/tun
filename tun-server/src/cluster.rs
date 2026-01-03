@@ -7,6 +7,9 @@ use crate::db::TunnelDb;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Information about a peer server in the cluster.
@@ -420,8 +423,248 @@ pub struct DbClusterStats {
     pub cached_locations: usize,
 }
 
+/// Connection pool for HTTP/1.1 connections to peer servers.
+/// Maintains persistent keep-alive connections to avoid TCP handshake overhead.
+pub struct PeerConnectionPool {
+    /// Map of peer address -> list of pooled connections
+    connections: DashMap<String, Vec<Arc<Mutex<PooledTcpConnection>>>>,
+    /// Maximum age of a pooled connection before it's refreshed
+    max_age: Duration,
+    /// Maximum connections per peer
+    max_per_peer: usize,
+    /// Statistics
+    stats: std::sync::atomic::AtomicUsize,
+    reused: std::sync::atomic::AtomicUsize,
+}
+
+/// A pooled TCP connection to a peer server.
+struct PooledTcpConnection {
+    stream: Option<TcpStream>,
+    created_at: Instant,
+    request_count: usize,
+}
+
+impl PeerConnectionPool {
+    /// Create a new connection pool.
+    pub fn new() -> Self {
+        Self {
+            connections: DashMap::new(),
+            max_age: Duration::from_secs(60),
+            max_per_peer: 4,
+            stats: std::sync::atomic::AtomicUsize::new(0),
+            reused: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Get a connection to a peer, reusing if available.
+    pub async fn get(&self, peer_addr: &str) -> Result<TcpStream, String> {
+        self.stats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        // Try to get a pooled connection
+        if let Some(mut entry) = self.connections.get_mut(peer_addr) {
+            while let Some(conn_arc) = entry.pop() {
+                if let Ok(mut conn) = conn_arc.try_lock() {
+                    if let Some(stream) = conn.stream.take() {
+                        // Check if connection is still valid
+                        if conn.created_at.elapsed() < self.max_age && conn.request_count < 100 {
+                            self.reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!("Reusing pooled connection to {}", peer_addr);
+                            return Ok(stream);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Create new connection
+        debug!("Creating new connection to {}", peer_addr);
+        TcpStream::connect(peer_addr)
+            .await
+            .map_err(|e| format!("Failed to connect to peer {}: {}", peer_addr, e))
+    }
+
+    /// Return a connection to the pool for reuse.
+    pub fn put(&self, peer_addr: &str, stream: TcpStream, request_count: usize) {
+        let pooled = Arc::new(Mutex::new(PooledTcpConnection {
+            stream: Some(stream),
+            created_at: Instant::now(),
+            request_count,
+        }));
+        
+        self.connections
+            .entry(peer_addr.to_string())
+            .or_insert_with(Vec::new)
+            .push(pooled);
+        
+        // Trim excess connections
+        if let Some(mut entry) = self.connections.get_mut(peer_addr) {
+            while entry.len() > self.max_per_peer {
+                entry.remove(0);
+            }
+        }
+    }
+
+    /// Clear stale connections from the pool.
+    pub fn cleanup(&self) {
+        for mut entry in self.connections.iter_mut() {
+            entry.retain(|conn_arc| {
+                if let Ok(conn) = conn_arc.try_lock() {
+                    conn.created_at.elapsed() < self.max_age * 2
+                } else {
+                    true // Keep if we can't lock
+                }
+            });
+        }
+        // Remove empty entries
+        self.connections.retain(|_, v| !v.is_empty());
+    }
+
+    /// Get pool statistics.
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.stats.load(std::sync::atomic::Ordering::Relaxed),
+            self.reused.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for PeerConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global peer connection pool (lazy initialized).
+static PEER_POOL: std::sync::OnceLock<PeerConnectionPool> = std::sync::OnceLock::new();
+
+/// Get the global peer connection pool.
+pub fn get_peer_pool() -> &'static PeerConnectionPool {
+    PEER_POOL.get_or_init(PeerConnectionPool::new)
+}
+
+/// Route a request to another server in the cluster using pooled connections.
+/// Uses HTTP/1.1 with keep-alive for connection reuse.
+pub async fn route_to_peer_pooled(
+    peer_addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let pool = get_peer_pool();
+    
+    // Get connection from pool
+    let stream = pool.get(peer_addr).await?;
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+    
+    // Build HTTP request with keep-alive
+    let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
+    request.push_str(&format!("Host: {}\r\n", peer_addr));
+    request.push_str("X-Forwarded-By: cluster\r\n");
+    request.push_str("Connection: keep-alive\r\n"); // Enable keep-alive
+    request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("host")
+            && !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("connection")
+        {
+            request.push_str(&format!("{}: {}\r\n", name, value));
+        }
+    }
+    request.push_str("\r\n");
+
+    // Send request
+    writer
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write request: {}", e))?;
+    writer
+        .write_all(body)
+        .await
+        .map_err(|e| format!("Failed to write body: {}", e))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush: {}", e))?;
+
+    // Read status line
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .map_err(|e| format!("Failed to read status line: {}", e))?;
+
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("Invalid status line: {}", status_line))?;
+
+    // Read headers
+    let mut response_headers = Vec::new();
+    let mut content_length: Option<usize> = None;
+    let mut keep_alive = false;
+
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("Failed to read header: {}", e))?;
+
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+        if line.is_empty() {
+            break;
+        }
+
+        if let Some((name, value)) = line.split_once(": ") {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok();
+            }
+            if name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("keep-alive") {
+                keep_alive = true;
+            }
+            response_headers.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    // Read body based on Content-Length
+    let response_body = if let Some(len) = content_length {
+        let mut body = vec![0u8; len];
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| format!("Failed to read body: {}", e))?;
+        body
+    } else {
+        // No Content-Length - read until EOF (can't reuse connection)
+        keep_alive = false;
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .map_err(|e| format!("Failed to read body: {}", e))?;
+        body
+    };
+
+    // Return connection to pool if keep-alive
+    if keep_alive {
+        // Reunite the split stream
+        let stream = reader.into_inner().reunite(writer.into_inner()).ok();
+        if let Some(stream) = stream {
+            pool.put(peer_addr, stream, 1);
+        }
+    }
+
+    Ok((status, response_headers, response_body))
+}
+
 /// Route a request to another server in the cluster.
 /// Uses proper HTTP parsing with Content-Length handling for full response body.
+/// Consider using route_to_peer_pooled for better performance.
 pub async fn route_to_peer(
     peer_addr: &str,
     method: &str,
