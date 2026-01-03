@@ -189,15 +189,35 @@ jobs:
       - name: Prepare release assets
         run: |
           cd artifacts
-          echo "=== Before moving ==="
+          echo "=== Structure ==="
           find . -type f
-          # Move files from subdirectories to current directory
-          find . -mindepth 2 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
-          # Remove empty directories
-          find . -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
-          echo "=== After moving ==="
+          
+          # Create temp directory for files
+          mkdir -p release_files
+          
+          # Move files from subdirectories to temp directory
+          for dir in */; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"*; do
+                if [ -f "$file" ]; then
+                  echo "Moving: $file"
+                  mv "$file" release_files/
+                fi
+              done
+            fi
+          done
+          
+          # Remove artifact directories
+          find . -maxdepth 1 -mindepth 1 -type d ! -name release_files -exec rm -rf {} +
+          
+          # Move files back to artifacts root
+          mv release_files/* .
+          rmdir release_files
+          
+          echo "=== Release files ==="
           ls -la
-          # Create checksums only if files exist
+          
+          # Create checksums
           if ls *.tar.gz *.zip 1> /dev/null 2>&1; then
             sha256sum *.tar.gz *.zip > SHA256SUMS.txt
             echo "=== Checksums ==="
