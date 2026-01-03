@@ -47,6 +47,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use tracing::{debug, error, info, warn};
@@ -88,10 +89,10 @@ impl Default for RetryConfig {
 pub struct AppState {
     /// Tunnel registry for routing requests
     pub registry: Arc<TunnelRegistry>,
-    /// IP filter for allow/block lists
-    pub ip_filter: Arc<IpFilter>,
-    /// ACL manager for per-subdomain access control
-    pub acl_manager: Arc<AclManager>,
+    /// IP filter for allow/block lists (RwLock for hot reload support)
+    pub ip_filter: Arc<tokio::sync::RwLock<IpFilter>>,
+    /// ACL manager for per-subdomain access control (RwLock for hot reload support)
+    pub acl_manager: Arc<tokio::sync::RwLock<AclManager>>,
     /// Body size limiter for per-path limits
     pub body_limiter: Arc<BodyLimiter>,
     /// Request validator for security checks
@@ -110,8 +111,8 @@ impl AppState {
     /// Create new application state with all middleware components.
     pub fn new(
         registry: Arc<TunnelRegistry>,
-        ip_filter: Arc<IpFilter>,
-        acl_manager: Arc<AclManager>,
+        ip_filter: Arc<tokio::sync::RwLock<IpFilter>>,
+        acl_manager: Arc<tokio::sync::RwLock<AclManager>>,
         body_limiter: Arc<BodyLimiter>,
         validator: Arc<RequestValidator>,
     ) -> Self {
@@ -160,8 +161,8 @@ pub async fn run_proxy_server(
     rate_limiter: Arc<IpRateLimiter>,
 ) -> Result<()> {
     // Create default middleware components if not configured
-    let ip_filter = Arc::new(IpFilter::allow_all());
-    let acl_manager = Arc::new(AclManager::new());
+    let ip_filter = Arc::new(tokio::sync::RwLock::new(IpFilter::allow_all()));
+    let acl_manager = Arc::new(tokio::sync::RwLock::new(AclManager::new()));
     let body_limiter = Arc::new(BodyLimiter::new(
         crate::limits::BodyLimitConfig::new(registry.config.body_size_limit),
     ));
@@ -185,8 +186,8 @@ pub async fn run_proxy_server_with_middleware(
     addr: &str,
     registry: Arc<TunnelRegistry>,
     rate_limiter: Arc<IpRateLimiter>,
-    ip_filter: Arc<IpFilter>,
-    acl_manager: Arc<AclManager>,
+    ip_filter: Arc<tokio::sync::RwLock<IpFilter>>,
+    acl_manager: Arc<tokio::sync::RwLock<AclManager>>,
     body_limiter: Arc<BodyLimiter>,
     validator: Arc<RequestValidator>,
     transform_config: TransformConfig,
@@ -330,11 +331,48 @@ async fn proxy_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
+    // Generate request ID for tracing
+    let request_id = Uuid::new_v4().to_string();
+    
+    let response = proxy_handler_inner(state, host, addr, request, &request_id).await;
+    add_request_id(response, &request_id)
+}
+
+async fn proxy_handler_inner(
+    state: AppState,
+    host: String,
+    addr: SocketAddr,
+    request: Request<Body>,
+    request_id: &str,
+) -> Response<Body> {
     let start_time = Instant::now();
     let client_ip = extract_real_client_ip(&request, addr.ip());
+    
+    // Add request ID to tracing context
+    let _span = tracing::info_span!("proxy_request", 
+        request_id = %request_id,
+        method = %request.method(),
+        path = %request.uri().path()
+    );
+
+    // === Shutdown Check and Connection Registration ===
+    let _connection_guard = if let Some(ref signal) = state.shutdown_signal {
+        if signal.is_shutting_down() {
+            return json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shutting_down",
+                "Server is shutting down, please retry on another instance",
+                true,
+            );
+        }
+        // Register connection for draining
+        Some(signal.register_connection())
+    } else {
+        None
+    };
 
     // === Phase 1.3: IP Filter Check ===
-    if !state.ip_filter.is_allowed(client_ip) {
+    if !state.ip_filter.read().await.is_allowed(client_ip) {
         debug!("IP {} blocked by filter", client_ip);
         metrics::record_ip_blocked(&client_ip.to_string(), "blocklist");
         return json_error_response(
@@ -448,6 +486,18 @@ async fn proxy_handler(
 
     let tunnel_id_str = tunnel.id.to_string();
 
+    // === Circuit Breaker Check ===
+    if !state.circuit_breakers.can_execute(&tunnel_id_str) {
+        debug!("Circuit breaker OPEN for tunnel {}", tunnel_id_str);
+        metrics::record_circuit_breaker_trip(&tunnel_id_str);
+        return json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "circuit_open",
+            "Tunnel circuit breaker is open, please retry later",
+            true,
+        );
+    }
+
     // === Phase 1.4: ACL Check ===
     // Estimate body size from Content-Length header for ACL check
     let content_length = request
@@ -457,7 +507,7 @@ async fn proxy_handler(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    if let Err(denied) = state.acl_manager.check_request(&subdomain, client_ip, content_length) {
+    if let Err(denied) = state.acl_manager.read().await.check_request(&subdomain, client_ip, content_length) {
         debug!(
             "ACL denied for subdomain '{}' from IP {}: {}",
             subdomain, client_ip, denied
@@ -548,6 +598,14 @@ async fn proxy_handler(
                 _ => 0,
             };
 
+            // Record circuit breaker success for non-error responses
+            if status < 500 {
+                state.circuit_breakers.record_success(&tunnel_id_str);
+            } else {
+                // 5xx responses count as failures for circuit breaker
+                state.circuit_breakers.record_failure(&tunnel_id_str);
+            }
+
             metrics::record_request(
                 &tunnel_id_str,
                 status,
@@ -562,6 +620,9 @@ async fn proxy_handler(
         Err(e) => {
             let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
             error!("Tunnel request failed: {}", e);
+
+            // Record circuit breaker failure
+            state.circuit_breakers.record_failure(&tunnel_id_str);
 
             // Check if it's a timeout
             if e.to_string().contains("timeout") {
@@ -624,7 +685,7 @@ async fn websocket_upgrade_handler(
     let client_ip = addr.ip();
 
     // IP filter check for WebSocket upgrades
-    if !state.ip_filter.is_allowed(client_ip) {
+    if !state.ip_filter.read().await.is_allowed(client_ip) {
         debug!("IP {} blocked by filter for WebSocket", client_ip);
         return json_error_response(StatusCode::FORBIDDEN, "access_denied", "Access denied", false)
             .into_response();
@@ -646,11 +707,12 @@ async fn websocket_upgrade_handler(
     };
 
     // ACL check for WebSocket connections
-    if let Err(denied) = state.acl_manager.check_request(&subdomain, client_ip, 0) {
+    if let Err(denied) = state.acl_manager.read().await.check_request(&subdomain, client_ip, 0) {
+        let denied_str = denied.to_string();
         return json_error_response(
             StatusCode::FORBIDDEN,
             "acl_denied",
-            &denied.to_string(),
+            &denied_str,
             false,
         )
         .into_response();
@@ -1019,6 +1081,69 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
                 .body(Body::from("Internal error"))
                 .unwrap()
         })
+}
+
+/// Send a request through the tunnel with retry logic.
+/// Retries on connection failures and configured status codes.
+#[allow(dead_code)]
+async fn send_request_with_retry(
+    tunnel: &Arc<crate::tunnel::TunnelConnection>,
+    msg: Message,
+    config: &RetryConfig,
+    circuit_breakers: &CircuitBreakerManager,
+    tunnel_id: &str,
+) -> Result<Message, anyhow::Error> {
+    let mut last_error = None;
+
+    for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            debug!("Retrying request to tunnel {} (attempt {})", tunnel_id, attempt + 1);
+            tokio::time::sleep(config.retry_delay).await;
+        }
+
+        match tunnel.send_request(msg.clone()).await {
+            Ok(response_msg) => {
+                // Check if response status is retryable
+                let status = match &response_msg.payload {
+                    Payload::HttpResponse(r) => r.status,
+                    _ => 200,
+                };
+
+                if !config.retryable_status_codes.contains(&status) {
+                    // Success - record and return
+                    circuit_breakers.record_success(tunnel_id);
+                    return Ok(response_msg);
+                }
+
+                // Status is retryable
+                if attempt == config.max_retries {
+                    // Last attempt - return whatever we got
+                    circuit_breakers.record_failure(tunnel_id);
+                    return Ok(response_msg);
+                }
+
+                last_error = Some(anyhow::anyhow!("Retryable status code: {}", status));
+            }
+            Err(e) => {
+                circuit_breakers.record_failure(tunnel_id);
+                last_error = Some(e);
+
+                if attempt == config.max_retries {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Retry exhausted")))
+}
+
+/// Add X-Request-Id header to a response.
+fn add_request_id(mut response: Response<Body>, request_id: &str) -> Response<Body> {
+    if let Ok(value) = request_id.parse() {
+        response.headers_mut().insert("X-Request-Id", value);
+    }
+    response
 }
 
 /// Create a structured JSON error response (Phase 8: Structured Error Responses).
