@@ -20,6 +20,7 @@ mod ratelimit;
 mod shutdown;
 mod sse;
 mod tls;
+mod trace;
 mod tracing_otel;
 mod transform;
 mod tunnel;
