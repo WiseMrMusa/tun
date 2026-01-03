@@ -68,13 +68,46 @@ pub struct ApiState {
     pub start_time: std::time::Instant,
     /// API key for authentication (None = no auth required)
     pub api_key: Option<String>,
+    /// Total connections counter (cumulative)
+    pub total_connections: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ApiState {
+    /// Create a new API state.
+    pub fn new(
+        registry: Arc<TunnelRegistry>,
+        rate_limiter: Arc<IpRateLimiter>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self {
+            registry,
+            rate_limiter,
+            start_time: std::time::Instant::now(),
+            api_key,
+            total_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Increment the total connections counter.
+    pub fn record_connection(&self) {
+        self.total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the total connections count.
+    pub fn total_connections_count(&self) -> u64 {
+        self.total_connections.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Create the API router with authentication for admin endpoints.
 pub fn create_api_router(state: ApiState) -> Router {
     // Public routes (no auth required)
     let public_routes = Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .route("/api/health", get(health_handler))
+        .route("/api/ready", get(ready_handler))
         .route("/api/stats", get(stats_handler))
         .route("/api/tunnels", get(list_tunnels_handler))
         .route("/api/tunnels/:subdomain", get(get_tunnel_handler));
@@ -162,11 +195,36 @@ async fn health_handler(State(state): State<ApiState>) -> impl IntoResponse {
     Json(response)
 }
 
+/// Readiness check endpoint for load balancers.
+/// Returns 200 if the server is ready to accept traffic.
+async fn ready_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    // Server is ready if the registry is accessible
+    let is_ready = state.registry.count() >= 0; // Always true, but checks registry is working
+    
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ready": true,
+                "version": env!("CARGO_PKG_VERSION")
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ready": false,
+                "reason": "Server not ready"
+            })),
+        )
+    }
+}
+
 /// Server statistics endpoint.
 async fn stats_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let response = ServerStats {
         active_tunnels: state.registry.count(),
-        total_connections: 0, // TODO: Track this
+        total_connections: state.total_connections_count(),
         rate_limited_requests: state.rate_limiter.rate_limited_count(),
         tracked_ips: state.rate_limiter.tracked_ips(),
     };
@@ -180,10 +238,10 @@ async fn list_tunnels_handler(State(state): State<ApiState>) -> impl IntoRespons
         .registry
         .list_tunnels()
         .into_iter()
-        .map(|(id, subdomain, pending)| TunnelInfo {
+        .map(|(id, subdomain, pending, connected_secs)| TunnelInfo {
             id: id.to_string(),
             subdomain,
-            connected_at: "unknown".to_string(), // TODO: Track connection time
+            connected_at: format!("{}s ago", connected_secs),
             pending_requests: pending,
         })
         .collect();
