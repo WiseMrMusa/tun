@@ -238,10 +238,11 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
     info!("Your tunnel is live at: https://{}.your-server-domain", subdomain);
     info!("Forwarding to {}", config.local_addr());
 
-    // Start heartbeat task
+    // Start heartbeat task with configurable interval
+    let heartbeat_interval = config.heartbeat_interval;
     let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
     let heartbeat_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(heartbeat_interval));
         loop {
             interval.tick().await;
             if heartbeat_tx.send(()).await.is_err() {
@@ -249,6 +250,7 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
             }
         }
     });
+    debug!("Heartbeat interval: {}s", heartbeat_interval);
 
     // Channel for sending responses back through WebSocket
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(100);

@@ -88,6 +88,12 @@ pub struct ClientConfig {
     #[arg(long, env = "TUN_HEALTH_CHECK_INTERVAL", default_value = "0")]
     pub health_check_interval: u64,
 
+    /// Heartbeat interval in seconds (default: 20)
+    /// Lower values detect disconnects faster but increase overhead.
+    /// Recommended: 15-30 seconds depending on NAT/proxy timeout settings.
+    #[arg(long, env = "TUN_HEARTBEAT_INTERVAL", default_value = "20")]
+    pub heartbeat_interval: u64,
+
     /// Enable debug logging
     #[arg(long, env = "TUN_DEBUG")]
     pub debug: bool,
@@ -191,6 +197,7 @@ mod tests {
             verify_upstream: true,
             require_upstream: false,
             health_check_interval: 0,
+            heartbeat_interval: 20,
             debug: false,
         }
     }
