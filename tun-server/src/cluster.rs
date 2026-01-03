@@ -421,6 +421,7 @@ pub struct DbClusterStats {
 }
 
 /// Route a request to another server in the cluster.
+/// Uses proper HTTP parsing with Content-Length handling for full response body.
 pub async fn route_to_peer(
     peer_addr: &str,
     method: &str,
@@ -428,24 +429,27 @@ pub async fn route_to_peer(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
     let stream = TcpStream::connect(peer_addr)
         .await
         .map_err(|e| format!("Failed to connect to peer {}: {}", peer_addr, e))?;
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
 
     // Build HTTP request
     let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
     request.push_str(&format!("Host: {}\r\n", peer_addr));
     request.push_str("X-Forwarded-By: cluster\r\n");
+    request.push_str("Connection: close\r\n");
     request.push_str(&format!("Content-Length: {}\r\n", body.len()));
 
     for (name, value) in headers {
         if !name.eq_ignore_ascii_case("host")
             && !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("connection")
         {
             request.push_str(&format!("{}: {}\r\n", name, value));
         }
@@ -461,45 +465,65 @@ pub async fn route_to_peer(
         .write_all(body)
         .await
         .map_err(|e| format!("Failed to write body: {}", e))?;
-
-    // Read response
-    let mut response = vec![0u8; 8192];
-    let n = reader
-        .read(&mut response)
+    writer
+        .flush()
         .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+        .map_err(|e| format!("Failed to flush: {}", e))?;
 
-    // Parse response (simple parsing)
-    let response_str = String::from_utf8_lossy(&response[..n]);
-    let mut lines = response_str.lines();
+    // Read status line
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .map_err(|e| format!("Failed to read status line: {}", e))?;
 
-    let status_line = lines.next().ok_or("Empty response")?;
-    let status = status_line
+    let status: u16 = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or("Invalid status code")?;
+        .ok_or_else(|| format!("Invalid status line: {}", status_line))?;
 
+    // Read headers
     let mut response_headers = Vec::new();
-    let mut body_start = 0;
+    let mut content_length: Option<usize> = None;
 
-    for (i, line) in lines.enumerate() {
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("Failed to read header: {}", e))?;
+
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
         if line.is_empty() {
-            body_start = i + 2; // Skip status line and headers
             break;
         }
+
         if let Some((name, value)) = line.split_once(": ") {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok();
+            }
             response_headers.push((name.to_string(), value.to_string()));
         }
     }
 
-    // Extract body (simplified)
-    let response_body = response_str
-        .lines()
-        .skip(body_start)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_bytes();
+    // Read body based on Content-Length or until EOF
+    let response_body = if let Some(len) = content_length {
+        let mut body = vec![0u8; len];
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| format!("Failed to read body: {}", e))?;
+        body
+    } else {
+        // No Content-Length - read until EOF (connection close)
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .map_err(|e| format!("Failed to read body: {}", e))?;
+        body
+    };
 
     Ok((status, response_headers, response_body))
 }
