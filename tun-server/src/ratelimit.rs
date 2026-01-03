@@ -1,14 +1,15 @@
 //! Rate limiting middleware for tunnel server.
 //!
-//! Provides IP-based rate limiting for both the control plane and proxy endpoints
-//! using the governor crate with Tower integration. Includes LRU-based cleanup
-//! to bound memory usage.
+//! Provides IP-based, subdomain-based, and token-based rate limiting for both
+//! the control plane and proxy endpoints using the governor crate with Tower
+//! integration. Includes LRU-based cleanup to bound memory usage.
 
 use axum::{
     body::Body,
     extract::ConnectInfo,
     http::{Request, Response, StatusCode},
 };
+use dashmap::DashMap;
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -284,6 +285,271 @@ fn rate_limit_response() -> Response<Body> {
 /// Create a shared rate limiter that can be used across multiple services.
 pub fn create_shared_limiter(config: &RateLimitConfig) -> Arc<IpRateLimiter> {
     Arc::new(IpRateLimiter::new(config))
+}
+
+/// Entry in the subdomain rate limit cache.
+struct SubdomainRateLimitEntry {
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    last_access: Instant,
+}
+
+/// Per-subdomain rate limiter with LRU-based memory management.
+/// Limits requests by subdomain to prevent a single tunnel from overwhelming the service.
+pub struct SubdomainRateLimiter {
+    /// LRU cache of rate limiters by subdomain
+    cache: Mutex<LruCache<String, SubdomainRateLimitEntry>>,
+    /// Default quota configuration
+    default_quota: Quota,
+    /// Per-subdomain custom quotas
+    custom_quotas: DashMap<String, Quota>,
+    /// Counter for rate limited requests
+    rate_limited_count: std::sync::atomic::AtomicU64,
+}
+
+impl SubdomainRateLimiter {
+    /// Create a new subdomain rate limiter.
+    pub fn new(config: &RateLimitConfig) -> Self {
+        let capacity = NonZeroUsize::new(config.max_tracked_ips).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            cache: Mutex::new(LruCache::new(capacity)),
+            default_quota: config.to_quota(),
+            custom_quotas: dashmap::DashMap::new(),
+            rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Set a custom quota for a specific subdomain.
+    pub fn set_subdomain_quota(&self, subdomain: &str, rps: u32, burst: u32) {
+        let quota = Quota::per_second(NonZeroU32::new(rps).unwrap_or(NonZeroU32::MIN))
+            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN));
+        self.custom_quotas.insert(subdomain.to_string(), quota);
+        info!("Set custom rate limit for subdomain '{}': {} rps, {} burst", subdomain, rps, burst);
+    }
+
+    /// Remove a custom quota for a subdomain (reverts to default).
+    pub fn remove_subdomain_quota(&self, subdomain: &str) {
+        self.custom_quotas.remove(subdomain);
+    }
+
+    /// Check if a request to the given subdomain should be allowed.
+    pub fn check(&self, subdomain: &str) -> bool {
+        let mut cache = self.cache.lock().unwrap();
+        
+        // Get the appropriate quota for this subdomain
+        let quota = self.custom_quotas
+            .get(subdomain)
+            .map(|q| *q)
+            .unwrap_or(self.default_quota);
+
+        // Get or create entry for this subdomain
+        let entry = cache.get_or_insert_mut(subdomain.to_string(), || SubdomainRateLimitEntry {
+            limiter: RateLimiter::direct(quota),
+            last_access: Instant::now(),
+        });
+
+        entry.last_access = Instant::now();
+
+        let allowed = entry.limiter.check().is_ok();
+        if !allowed {
+            self.rate_limited_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("Rate limit exceeded for subdomain: {}", subdomain);
+        }
+
+        allowed
+    }
+
+    /// Get the number of tracked subdomains.
+    pub fn tracked_subdomains(&self) -> usize {
+        self.cache.lock().unwrap().len()
+    }
+
+    /// Get the number of rate limited requests.
+    pub fn rate_limited_count(&self) -> u64 {
+        self.rate_limited_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clean up old entries.
+    pub fn cleanup(&self, max_age_secs: u64) {
+        let mut cache = self.cache.lock().unwrap();
+        let cutoff = Instant::now() - std::time::Duration::from_secs(max_age_secs);
+
+        let keys_to_remove: Vec<String> = cache
+            .iter()
+            .filter(|(_, entry)| entry.last_access < cutoff)
+            .map(|(subdomain, _)| subdomain.clone())
+            .collect();
+
+        let removed = keys_to_remove.len();
+        for subdomain in keys_to_remove {
+            cache.pop(&subdomain);
+        }
+
+        if removed > 0 {
+            info!("Subdomain rate limiter cleanup: removed {} stale entries", removed);
+        }
+    }
+}
+
+/// Entry in the token rate limit cache.
+struct TokenRateLimitEntry {
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    last_access: Instant,
+}
+
+/// Per-token rate limiter for controlling tunnel usage.
+/// Limits requests by authentication token to enforce fair usage.
+pub struct TokenRateLimiter {
+    /// LRU cache of rate limiters by token ID
+    cache: Mutex<LruCache<String, TokenRateLimitEntry>>,
+    /// Default quota configuration
+    default_quota: Quota,
+    /// Per-token custom quotas
+    custom_quotas: DashMap<String, Quota>,
+    /// Counter for rate limited requests
+    rate_limited_count: std::sync::atomic::AtomicU64,
+}
+
+impl TokenRateLimiter {
+    /// Create a new token rate limiter.
+    pub fn new(config: &RateLimitConfig) -> Self {
+        let capacity = NonZeroUsize::new(config.max_tracked_ips).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            cache: Mutex::new(LruCache::new(capacity)),
+            default_quota: config.to_quota(),
+            custom_quotas: dashmap::DashMap::new(),
+            rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Set a custom quota for a specific token.
+    pub fn set_token_quota(&self, token_id: &str, rps: u32, burst: u32) {
+        let quota = Quota::per_second(NonZeroU32::new(rps).unwrap_or(NonZeroU32::MIN))
+            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN));
+        self.custom_quotas.insert(token_id.to_string(), quota);
+        info!("Set custom rate limit for token '{}': {} rps, {} burst", token_id, rps, burst);
+    }
+
+    /// Remove a custom quota for a token.
+    pub fn remove_token_quota(&self, token_id: &str) {
+        self.custom_quotas.remove(token_id);
+    }
+
+    /// Check if a request with the given token should be allowed.
+    pub fn check(&self, token_id: &str) -> bool {
+        let mut cache = self.cache.lock().unwrap();
+        
+        let quota = self.custom_quotas
+            .get(token_id)
+            .map(|q| *q)
+            .unwrap_or(self.default_quota);
+
+        let entry = cache.get_or_insert_mut(token_id.to_string(), || TokenRateLimitEntry {
+            limiter: RateLimiter::direct(quota),
+            last_access: Instant::now(),
+        });
+
+        entry.last_access = Instant::now();
+
+        let allowed = entry.limiter.check().is_ok();
+        if !allowed {
+            self.rate_limited_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!("Rate limit exceeded for token: {}", token_id);
+        }
+
+        allowed
+    }
+
+    /// Get the number of tracked tokens.
+    pub fn tracked_tokens(&self) -> usize {
+        self.cache.lock().unwrap().len()
+    }
+
+    /// Get the number of rate limited requests.
+    pub fn rate_limited_count(&self) -> u64 {
+        self.rate_limited_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clean up old entries.
+    pub fn cleanup(&self, max_age_secs: u64) {
+        let mut cache = self.cache.lock().unwrap();
+        let cutoff = Instant::now() - std::time::Duration::from_secs(max_age_secs);
+
+        let keys_to_remove: Vec<String> = cache
+            .iter()
+            .filter(|(_, entry)| entry.last_access < cutoff)
+            .map(|(token_id, _)| token_id.clone())
+            .collect();
+
+        let removed = keys_to_remove.len();
+        for token_id in keys_to_remove {
+            cache.pop(&token_id);
+        }
+
+        if removed > 0 {
+            info!("Token rate limiter cleanup: removed {} stale entries", removed);
+        }
+    }
+}
+
+/// Combined rate limiter that checks IP, subdomain, and token limits.
+pub struct CombinedRateLimiter {
+    /// IP-based rate limiter
+    pub ip_limiter: Arc<IpRateLimiter>,
+    /// Subdomain-based rate limiter
+    pub subdomain_limiter: Arc<SubdomainRateLimiter>,
+    /// Token-based rate limiter (optional)
+    pub token_limiter: Option<Arc<TokenRateLimiter>>,
+}
+
+impl CombinedRateLimiter {
+    /// Create a new combined rate limiter.
+    pub fn new(config: &RateLimitConfig) -> Self {
+        Self {
+            ip_limiter: Arc::new(IpRateLimiter::new(config)),
+            subdomain_limiter: Arc::new(SubdomainRateLimiter::new(config)),
+            token_limiter: None,
+        }
+    }
+
+    /// Enable token-based rate limiting.
+    pub fn with_token_limiter(mut self, config: &RateLimitConfig) -> Self {
+        self.token_limiter = Some(Arc::new(TokenRateLimiter::new(config)));
+        self
+    }
+
+    /// Check all applicable rate limits.
+    /// Returns None if allowed, or Some(reason) if rate limited.
+    pub fn check(&self, ip: IpAddr, subdomain: &str, token_id: Option<&str>) -> Option<&'static str> {
+        // Check IP limit first
+        if !self.ip_limiter.check(ip) {
+            return Some("ip");
+        }
+
+        // Check subdomain limit
+        if !self.subdomain_limiter.check(subdomain) {
+            return Some("subdomain");
+        }
+
+        // Check token limit if enabled and token provided
+        if let (Some(ref limiter), Some(token_id)) = (&self.token_limiter, token_id) {
+            if !limiter.check(token_id) {
+                return Some("token");
+            }
+        }
+
+        None
+    }
+
+    /// Clean up all rate limiters.
+    pub fn cleanup(&self, max_age_secs: u64) {
+        self.ip_limiter.cleanup(max_age_secs);
+        self.subdomain_limiter.cleanup(max_age_secs);
+        if let Some(ref limiter) = self.token_limiter {
+            limiter.cleanup(max_age_secs);
+        }
+    }
 }
 
 #[cfg(test)]

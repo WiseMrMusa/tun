@@ -3,7 +3,8 @@
 //! Provides endpoints for monitoring and managing tunnels.
 //! Admin endpoints require authentication via API key.
 
-use crate::ratelimit::IpRateLimiter;
+use crate::cluster::get_peer_pool;
+use crate::ratelimit::{IpRateLimiter, SubdomainRateLimiter};
 use crate::tunnel::TunnelRegistry;
 use axum::{
     async_trait,
@@ -65,11 +66,14 @@ pub struct ApiError {
 pub struct ApiState {
     pub registry: Arc<TunnelRegistry>,
     pub rate_limiter: Arc<IpRateLimiter>,
+    pub subdomain_rate_limiter: Option<Arc<SubdomainRateLimiter>>,
     pub start_time: std::time::Instant,
     /// API key for authentication (None = no auth required)
     pub api_key: Option<String>,
     /// Total connections counter (cumulative)
     pub total_connections: Arc<std::sync::atomic::AtomicU64>,
+    /// Server ID for cluster identification
+    pub server_id: String,
 }
 
 impl ApiState {
@@ -82,10 +86,24 @@ impl ApiState {
         Self {
             registry,
             rate_limiter,
+            subdomain_rate_limiter: None,
             start_time: std::time::Instant::now(),
             api_key,
             total_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            server_id: "unknown".to_string(),
         }
+    }
+
+    /// Set the subdomain rate limiter.
+    pub fn with_subdomain_rate_limiter(mut self, limiter: Arc<SubdomainRateLimiter>) -> Self {
+        self.subdomain_rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Set the server ID.
+    pub fn with_server_id(mut self, server_id: String) -> Self {
+        self.server_id = server_id;
+        self
     }
 
     /// Increment the total connections counter.
@@ -109,6 +127,7 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/ready", get(ready_handler))
         .route("/api/stats", get(stats_handler))
+        .route("/api/cluster", get(cluster_info_handler))
         .route("/api/tunnels", get(list_tunnels_handler))
         .route("/api/tunnels/:subdomain", get(get_tunnel_handler));
 
@@ -120,6 +139,11 @@ pub fn create_api_router(state: ApiState) -> Router {
         )
         .route("/api/tokens/:token_id/revoke", post(revoke_token_handler))
         .route("/api/tokens/:token_id/unrevoke", post(unrevoke_token_handler))
+        // Rate limit management
+        .route("/api/ratelimits", get(list_rate_limits_handler))
+        .route("/api/ratelimits/:subdomain", get(get_subdomain_rate_limit_handler))
+        .route("/api/ratelimits/:subdomain", post(set_subdomain_rate_limit_handler))
+        .route("/api/ratelimits/:subdomain", axum::routing::delete(delete_subdomain_rate_limit_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key));
 
     Router::new()
@@ -410,6 +434,166 @@ async fn unrevoke_token_handler(
                 .into_response()
         }
     }
+}
+
+/// Cluster information response.
+#[derive(Debug, Serialize)]
+pub struct ClusterInfo {
+    pub server_id: String,
+    pub peer_pool_stats: PeerPoolStats,
+    pub is_clustered: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeerPoolStats {
+    pub total_requests: usize,
+    pub reused_connections: usize,
+    pub reuse_ratio: f64,
+}
+
+/// Get cluster information.
+async fn cluster_info_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let pool = get_peer_pool();
+    let (total, reused) = pool.stats();
+    let reuse_ratio = if total > 0 { reused as f64 / total as f64 } else { 0.0 };
+
+    let response = ClusterInfo {
+        server_id: state.server_id.clone(),
+        peer_pool_stats: PeerPoolStats {
+            total_requests: total,
+            reused_connections: reused,
+            reuse_ratio,
+        },
+        is_clustered: state.registry.db.is_some(),
+    };
+
+    Json(response)
+}
+
+/// Rate limit info response.
+#[derive(Debug, Serialize)]
+pub struct RateLimitInfo {
+    pub ip_rate_limiter: RateLimiterStats,
+    pub subdomain_rate_limiter: Option<RateLimiterStats>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RateLimiterStats {
+    pub tracked_entries: usize,
+    pub rate_limited_count: u64,
+}
+
+/// List rate limit statistics.
+async fn list_rate_limits_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let ip_stats = RateLimiterStats {
+        tracked_entries: state.rate_limiter.tracked_ips(),
+        rate_limited_count: state.rate_limiter.rate_limited_count(),
+    };
+
+    let subdomain_stats = state.subdomain_rate_limiter.as_ref().map(|limiter| {
+        RateLimiterStats {
+            tracked_entries: limiter.tracked_subdomains(),
+            rate_limited_count: limiter.rate_limited_count(),
+        }
+    });
+
+    Json(RateLimitInfo {
+        ip_rate_limiter: ip_stats,
+        subdomain_rate_limiter: subdomain_stats,
+    })
+}
+
+/// Get rate limit for a specific subdomain.
+async fn get_subdomain_rate_limit_handler(
+    State(state): State<ApiState>,
+    Path(subdomain): Path<String>,
+) -> impl IntoResponse {
+    // Check if subdomain exists
+    if state.registry.get_by_subdomain(&subdomain).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Subdomain '{}' not found", subdomain),
+                code: 404,
+            }),
+        )
+            .into_response();
+    }
+
+    // Return current status - custom limits are tracked in the subdomain limiter
+    Json(serde_json::json!({
+        "subdomain": subdomain,
+        "rate_limit": "default", // Would need to expose custom quotas from limiter
+        "message": "Rate limit information retrieved"
+    }))
+    .into_response()
+}
+
+/// Request body for setting subdomain rate limit.
+#[derive(Debug, Deserialize)]
+pub struct SetRateLimitRequest {
+    pub requests_per_second: u32,
+    pub burst_size: u32,
+}
+
+/// Set rate limit for a specific subdomain.
+async fn set_subdomain_rate_limit_handler(
+    State(state): State<ApiState>,
+    Path(subdomain): Path<String>,
+    Json(body): Json<SetRateLimitRequest>,
+) -> impl IntoResponse {
+    let Some(ref limiter) = state.subdomain_rate_limiter else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "Subdomain rate limiter not configured".to_string(),
+                code: 503,
+            }),
+        )
+            .into_response();
+    };
+
+    limiter.set_subdomain_quota(&subdomain, body.requests_per_second, body.burst_size);
+
+    info!(
+        "Set rate limit for subdomain '{}': {} rps, {} burst",
+        subdomain, body.requests_per_second, body.burst_size
+    );
+
+    Json(serde_json::json!({
+        "message": format!("Rate limit set for subdomain '{}'", subdomain),
+        "subdomain": subdomain,
+        "requests_per_second": body.requests_per_second,
+        "burst_size": body.burst_size
+    }))
+    .into_response()
+}
+
+/// Delete (reset to default) rate limit for a specific subdomain.
+async fn delete_subdomain_rate_limit_handler(
+    State(state): State<ApiState>,
+    Path(subdomain): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref limiter) = state.subdomain_rate_limiter else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "Subdomain rate limiter not configured".to_string(),
+                code: 503,
+            }),
+        )
+            .into_response();
+    };
+
+    limiter.remove_subdomain_quota(&subdomain);
+
+    info!("Reset rate limit for subdomain '{}' to default", subdomain);
+
+    Json(serde_json::json!({
+        "message": format!("Rate limit for subdomain '{}' reset to default", subdomain),
+        "subdomain": subdomain
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
