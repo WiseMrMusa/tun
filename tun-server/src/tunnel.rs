@@ -47,6 +47,8 @@ pub struct TunnelConnection {
     pub request_timeout: u64,
     /// WebSocket session manager for frame forwarding
     pub websocket_manager: WebSocketManager,
+    /// When this tunnel was connected
+    pub connected_at: std::time::Instant,
 }
 
 impl TunnelConnection {
@@ -58,6 +60,7 @@ impl TunnelConnection {
             pending_requests: DashMap::new(),
             request_timeout,
             websocket_manager: WebSocketManager::new(),
+            connected_at: std::time::Instant::now(),
         }
     }
 
@@ -74,7 +77,13 @@ impl TunnelConnection {
             pending_requests: DashMap::new(),
             request_timeout,
             websocket_manager: WebSocketManager::new(),
+            connected_at: std::time::Instant::now(),
         }
+    }
+
+    /// Get the duration since this tunnel was connected.
+    pub fn connected_duration(&self) -> std::time::Duration {
+        self.connected_at.elapsed()
     }
 
     /// Send an HTTP request and wait for a response.
@@ -234,12 +243,19 @@ impl TunnelRegistry {
 
     /// List all active tunnels.
     /// Returns tuples of (tunnel_id, subdomain, pending_request_count).
-    pub fn list_tunnels(&self) -> Vec<(TunnelId, String, usize)> {
+    /// List all active tunnels with their info.
+    /// Returns: (tunnel_id, subdomain, pending_requests, connected_duration_secs)
+    pub fn list_tunnels(&self) -> Vec<(TunnelId, String, usize, u64)> {
         self.tunnels_by_id
             .iter()
             .map(|entry| {
                 let tunnel = entry.value();
-                (tunnel.id, tunnel.subdomain.clone(), tunnel.pending_requests.len())
+                (
+                    tunnel.id,
+                    tunnel.subdomain.clone(),
+                    tunnel.pending_requests.len(),
+                    tunnel.connected_duration().as_secs(),
+                )
             })
             .collect()
     }
