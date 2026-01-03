@@ -498,6 +498,7 @@ mod tests {
             uri: "/api/test".to_string(),
             headers: vec![("Host".to_string(), "example.com".to_string())],
             body: vec![],
+            version: HttpVersion::default(),
         };
         let msg = Message::http_request(RequestId::new(), request);
         let bytes = msg.to_bytes().unwrap();
