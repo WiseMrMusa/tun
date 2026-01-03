@@ -189,8 +189,12 @@ jobs:
       - name: Create checksums
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          # Move files from subdirectories to current directory
+          find . -mindepth 2 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          # Remove empty directories
+          find . -type d -empty -delete
+          # Create checksums
+          sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -218,11 +222,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get version
+      - name: Get version and repo info
         id: version
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # Lowercase the repository owner for Docker tags
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo_owner=$REPO_OWNER" >> $GITHUB_OUTPUT
 
       - name: Download Linux x86_64 artifact
         uses: actions/download-artifact@v4
@@ -263,8 +270,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/tun-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}/tun-server:latest
+            ghcr.io/${{ steps.version.outputs.repo_owner }}/tun-server:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.repo_owner }}/tun-server:latest
 
       - name: Build and push client image
         uses: docker/build-push-action@v5
@@ -274,6 +281,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/tun-client:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}/tun-client:latest
+            ghcr.io/${{ steps.version.outputs.repo_owner }}/tun-client:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.repo_owner }}/tun-client:latest
 
