@@ -1,7 +1,7 @@
 //! Tunnel connection and local port forwarding.
 //!
 //! Supports both HTTP/1.1 and HTTP/2 for forwarding requests to local services.
-//! Also supports WebSocket frame forwarding.
+//! Also supports WebSocket frame forwarding and streaming large request bodies.
 
 use crate::config::ClientConfig;
 use crate::pool::{ConnectionPool, PoolConfig};
@@ -25,7 +25,7 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 use tun_core::protocol::{
     HttpMethod, HttpRequestData, HttpResponseData, HttpVersion, Message, MessageType, Payload,
-    RequestId, WebSocketFrameData, WebSocketOpcode,
+    RequestId, StreamChunkData, WebSocketFrameData, WebSocketOpcode,
 };
 
 /// Active WebSocket sessions being relayed.
@@ -55,6 +55,78 @@ impl WebSocketSessions {
         } else {
             false
         }
+    }
+}
+
+/// In-progress streaming request data.
+struct StreamingRequest {
+    /// The HTTP request metadata (method, uri, headers)
+    request: HttpRequestData,
+    /// Accumulated body chunks, keyed by chunk_index
+    chunks: Vec<(u32, Vec<u8>)>,
+}
+
+/// Manager for streaming requests that arrive in chunks.
+struct StreamingRequestManager {
+    /// In-progress streaming requests by request ID
+    requests: DashMap<RequestId, StreamingRequest>,
+}
+
+impl StreamingRequestManager {
+    fn new() -> Self {
+        Self {
+            requests: DashMap::new(),
+        }
+    }
+
+    /// Start a new streaming request with the initial metadata.
+    fn start(&self, request_id: RequestId, request: HttpRequestData) {
+        self.requests.insert(
+            request_id,
+            StreamingRequest {
+                request,
+                chunks: Vec::new(),
+            },
+        );
+    }
+
+    /// Add a chunk to an in-progress streaming request.
+    /// Returns the completed request if this was the final chunk.
+    fn add_chunk(&self, request_id: RequestId, chunk: StreamChunkData) -> Option<HttpRequestData> {
+        if let Some(mut entry) = self.requests.get_mut(&request_id) {
+            entry.chunks.push((chunk.chunk_index, chunk.data));
+
+            if chunk.is_final {
+                // Sort chunks by index and concatenate
+                let mut streaming = self.requests.remove(&request_id)?.1;
+                streaming.chunks.sort_by_key(|(idx, _)| *idx);
+                
+                let body: Vec<u8> = streaming.chunks.into_iter().flat_map(|(_, data)| data).collect();
+                let mut request = streaming.request;
+                request.body = body;
+                
+                return Some(request);
+            }
+        }
+        None
+    }
+
+    /// Handle stream end marker - assemble the request even if no final chunk was marked.
+    fn complete(&self, request_id: RequestId) -> Option<HttpRequestData> {
+        if let Some((_, mut streaming)) = self.requests.remove(&request_id) {
+            streaming.chunks.sort_by_key(|(idx, _)| *idx);
+            let body: Vec<u8> = streaming.chunks.into_iter().flat_map(|(_, data)| data).collect();
+            let mut request = streaming.request;
+            request.body = body;
+            Some(request)
+        } else {
+            None
+        }
+    }
+
+    /// Clean up a cancelled or timed out request.
+    fn cancel(&self, request_id: RequestId) {
+        self.requests.remove(&request_id);
     }
 }
 
@@ -102,6 +174,9 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
 
     // WebSocket session manager for frame forwarding
     let ws_sessions = Arc::new(WebSocketSessions::new());
+    
+    // Streaming request manager for large body handling
+    let streaming_manager = Arc::new(StreamingRequestManager::new());
     
     // Initialize connection pool for local service connections
     let pool_config = PoolConfig {
@@ -211,9 +286,10 @@ async fn run_tunnel(config: &ClientConfig) -> Result<()> {
                         let response_tx = response_tx.clone();
                         let config = config.clone();
                         let ws_sessions = ws_sessions.clone();
+                        let streaming = streaming_manager.clone();
                         let pool = connection_pool.clone();
                         tokio::spawn(async move {
-                            handle_server_message(msg, &config, response_tx, ws_sessions, pool).await;
+                            handle_server_message(msg, &config, response_tx, ws_sessions, streaming, pool).await;
                         });
                     }
                     Err(e) => {
@@ -258,6 +334,7 @@ async fn handle_server_message(
     config: &crate::config::ClientConfig,
     response_tx: tokio::sync::mpsc::Sender<Message>,
     ws_sessions: Arc<WebSocketSessions>,
+    streaming_manager: Arc<StreamingRequestManager>,
     pool: Arc<ConnectionPool>,
 ) {
     match msg.msg_type {
@@ -265,13 +342,61 @@ async fn handle_server_message(
             let request_id = msg.request_id.unwrap_or_else(RequestId::new);
 
             if let Payload::HttpRequest(request_data) = msg.payload {
-                // Route to the appropriate local port based on path
-                let local_addr = config.local_addr_for_path(&request_data.uri);
-                let response = forward_http_request(&local_addr, request_data, &pool).await;
+                // Check if this is a streaming request (empty body with content-length header)
+                let is_streaming = request_data.body.is_empty() && 
+                    request_data.headers.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("content-length") && 
+                        v.parse::<usize>().map(|l| l > 0).unwrap_or(false)
+                    });
+                
+                if is_streaming {
+                    // Start streaming - wait for chunks
+                    debug!("Starting streaming request {} (waiting for chunks)", request_id);
+                    streaming_manager.start(request_id, request_data);
+                } else {
+                    // Regular request - forward immediately
+                    let local_addr = config.local_addr_for_path(&request_data.uri);
+                    let response = forward_http_request(&local_addr, request_data, &pool).await;
+                    let response_msg = Message::http_response(request_id, response);
+
+                    if response_tx.send(response_msg).await.is_err() {
+                        error!("Failed to send response");
+                    }
+                }
+            }
+        }
+        MessageType::StreamChunk => {
+            let request_id = msg.request_id.unwrap_or_else(RequestId::new);
+            
+            if let Payload::StreamChunk(chunk) = msg.payload {
+                debug!("Received stream chunk {} for request {} (final: {})", 
+                    chunk.chunk_index, request_id, chunk.is_final);
+                
+                // Add chunk to streaming manager
+                if let Some(completed_request) = streaming_manager.add_chunk(request_id, chunk) {
+                    // Request is complete, forward it
+                    let local_addr = config.local_addr_for_path(&completed_request.uri);
+                    let response = forward_http_request(&local_addr, completed_request, &pool).await;
+                    let response_msg = Message::http_response(request_id, response);
+
+                    if response_tx.send(response_msg).await.is_err() {
+                        error!("Failed to send response for streamed request");
+                    }
+                }
+            }
+        }
+        MessageType::StreamEnd => {
+            let request_id = msg.request_id.unwrap_or_else(RequestId::new);
+            debug!("Stream end for request {}", request_id);
+            
+            // Complete the streaming request
+            if let Some(completed_request) = streaming_manager.complete(request_id) {
+                let local_addr = config.local_addr_for_path(&completed_request.uri);
+                let response = forward_http_request(&local_addr, completed_request, &pool).await;
                 let response_msg = Message::http_response(request_id, response);
 
                 if response_tx.send(response_msg).await.is_err() {
-                    error!("Failed to send response");
+                    error!("Failed to send response for streamed request");
                 }
             }
         }
@@ -325,10 +450,11 @@ async fn handle_server_message(
             }
         }
         MessageType::Close => {
-            // Close WebSocket session
+            // Close WebSocket session and cancel any streaming request
             if let Some(request_id) = msg.request_id {
                 ws_sessions.unregister(request_id);
-                debug!("Closed WebSocket session {}", request_id);
+                streaming_manager.cancel(request_id);
+                debug!("Closed session {}", request_id);
             }
         }
         MessageType::TcpData => {
