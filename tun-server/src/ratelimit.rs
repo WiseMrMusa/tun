@@ -26,6 +26,11 @@ use std::{
 };
 use tower::{Layer, Service};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
+use serde_json;
+
+// Re-export TrustedProxyFilter from proxy module
+pub use crate::proxy::TrustedProxyFilter;
 
 /// Default maximum number of IPs to track.
 const DEFAULT_MAX_TRACKED_IPS: usize = 100_000;
@@ -169,17 +174,34 @@ impl IpRateLimiter {
 #[derive(Clone)]
 pub struct RateLimitLayer {
     limiter: Arc<IpRateLimiter>,
+    trusted_proxies: Arc<TrustedProxyFilter>,
 }
 
 impl RateLimitLayer {
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
             limiter: Arc::new(IpRateLimiter::new(config)),
+            trusted_proxies: Arc::new(TrustedProxyFilter::default()),
         }
     }
 
     pub fn from_limiter(limiter: Arc<IpRateLimiter>) -> Self {
-        Self { limiter }
+        Self {
+            limiter,
+            trusted_proxies: Arc::new(TrustedProxyFilter::default()),
+        }
+    }
+
+    /// Set the trusted proxy filter for secure X-Forwarded-For handling.
+    pub fn with_trusted_proxies(mut self, filter: TrustedProxyFilter) -> Self {
+        self.trusted_proxies = Arc::new(filter);
+        self
+    }
+
+    /// Set the trusted proxy filter from an Arc.
+    pub fn with_trusted_proxies_arc(mut self, filter: Arc<TrustedProxyFilter>) -> Self {
+        self.trusted_proxies = filter;
+        self
     }
 }
 
@@ -190,6 +212,7 @@ impl<S> Layer<S> for RateLimitLayer {
         RateLimitService {
             inner,
             limiter: self.limiter.clone(),
+            trusted_proxies: self.trusted_proxies.clone(),
         }
     }
 }
@@ -199,6 +222,7 @@ impl<S> Layer<S> for RateLimitLayer {
 pub struct RateLimitService<S> {
     inner: S,
     limiter: Arc<IpRateLimiter>,
+    trusted_proxies: Arc<TrustedProxyFilter>,
 }
 
 impl<S> Service<Request<Body>> for RateLimitService<S>
@@ -217,8 +241,8 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Try to extract IP from ConnectInfo or headers
-        let ip = extract_client_ip(&req);
+        // Try to extract IP from ConnectInfo or headers, using trusted proxy filter
+        let ip = extract_client_ip(&req, &self.trusted_proxies);
 
         let limiter = self.limiter.clone();
         let mut inner = self.inner.clone();
@@ -237,15 +261,32 @@ where
     }
 }
 
-/// Extract client IP from request.
-/// Checks X-Forwarded-For header first (for proxied requests), then falls back to connection info.
-fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+/// Extract client IP from request with trusted proxy validation.
+/// Only trusts X-Forwarded-For and X-Real-IP headers if the direct connection
+/// is from a trusted proxy. Otherwise, uses the direct connection IP.
+fn extract_client_ip<B>(req: &Request<B>, trusted_proxies: &TrustedProxyFilter) -> Option<IpAddr> {
+    // Get the direct connection IP first
+    let direct_ip = req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+
+    let Some(direct_ip) = direct_ip else {
+        return None;
+    };
+
+    // Only trust forwarded headers if connection is from a trusted proxy
+    if !trusted_proxies.is_trusted(direct_ip) {
+        debug!("Direct IP {} is not a trusted proxy, ignoring forwarded headers", direct_ip);
+        return Some(direct_ip);
+    }
+
     // Check X-Forwarded-For header (common when behind a proxy)
     if let Some(forwarded_for) = req.headers().get("x-forwarded-for") {
         if let Ok(value) = forwarded_for.to_str() {
             // Take the first IP in the list (original client)
             if let Some(ip_str) = value.split(',').next() {
                 if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                    debug!("Using client IP {} from X-Forwarded-For (trusted proxy: {})", ip, direct_ip);
                     return Some(ip);
                 }
             }
@@ -256,28 +297,40 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
     if let Some(real_ip) = req.headers().get("x-real-ip") {
         if let Ok(value) = real_ip.to_str() {
             if let Ok(ip) = value.parse::<IpAddr>() {
+                debug!("Using client IP {} from X-Real-IP (trusted proxy: {})", ip, direct_ip);
                 return Some(ip);
             }
         }
     }
 
-    // Fall back to connection info
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip())
+    // Fall back to direct connection IP
+    Some(direct_ip)
 }
 
-/// Create a 429 Too Many Requests response.
+/// Create a 429 Too Many Requests response with request ID for tracing.
 fn rate_limit_response() -> Response<Body> {
+    let request_id = Uuid::new_v4().to_string();
+    let body = serde_json::json!({
+        "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit exceeded. Please slow down.",
+            "status": 429,
+            "request_id": request_id,
+            "retryable": true
+        }
+    });
+
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
-        .header("Content-Type", "text/plain")
+        .header("Content-Type", "application/json")
+        .header("X-Request-Id", &request_id)
         .header("Retry-After", "1")
-        .body(Body::from("Rate limit exceeded. Please slow down."))
+        .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Internal error"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"error":{"code":"internal_error","message":"Internal server error"}}"#))
                 .unwrap()
         })
 }
