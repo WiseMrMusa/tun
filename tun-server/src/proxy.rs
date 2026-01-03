@@ -13,7 +13,8 @@
 
 use crate::acl::{AclDenied, AclManager};
 use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
-use crate::cluster::{route_to_peer, DbClusterCoordinator};
+use crate::cluster::{route_to_peer_pooled, DbClusterCoordinator};
+use crate::trace::{add_trace_headers, TraceContext};
 use crate::ipfilter::IpFilter;
 use crate::limits::BodyLimiter;
 use crate::metrics;
@@ -84,6 +85,86 @@ impl Default for RetryConfig {
     }
 }
 
+/// Configuration for streaming large request bodies.
+#[derive(Clone)]
+pub struct StreamingConfig {
+    /// Threshold in bytes above which streaming is used
+    pub threshold: usize,
+    /// Size of each stream chunk in bytes
+    pub chunk_size: usize,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 1024 * 1024, // 1MB
+            chunk_size: 64 * 1024,  // 64KB
+        }
+    }
+}
+
+/// Trusted proxy filter for secure X-Forwarded-For handling.
+/// Only trusts forwarded headers when the direct connection is from a trusted proxy.
+#[derive(Clone)]
+pub struct TrustedProxyFilter {
+    /// Trusted proxy IP networks
+    networks: Vec<ipnet::IpNet>,
+    /// If true, trust all proxies (insecure but backwards compatible)
+    trust_all: bool,
+}
+
+impl TrustedProxyFilter {
+    /// Create a new filter from a list of trusted proxy CIDR/IP strings.
+    /// If the list is empty or None, trust all proxies (backwards compatible).
+    pub fn new(proxies: Option<&[String]>) -> Self {
+        match proxies {
+            Some(proxies) if !proxies.is_empty() => {
+                let networks: Vec<ipnet::IpNet> = proxies
+                    .iter()
+                    .filter_map(|s| {
+                        // Try parsing as CIDR first
+                        if let Ok(net) = s.parse::<ipnet::IpNet>() {
+                            Some(net)
+                        } else if let Ok(ip) = s.parse::<IpAddr>() {
+                            // Convert single IP to /32 or /128
+                            Some(ipnet::IpNet::from(ip))
+                        } else {
+                            warn!("Invalid trusted proxy: {}", s);
+                            None
+                        }
+                    })
+                    .collect();
+                
+                if networks.is_empty() {
+                    warn!("No valid trusted proxies configured, trusting all");
+                    Self { networks: Vec::new(), trust_all: true }
+                } else {
+                    info!("Configured {} trusted proxy networks", networks.len());
+                    Self { networks, trust_all: false }
+                }
+            }
+            _ => {
+                debug!("No trusted proxies configured, trusting all (insecure)");
+                Self { networks: Vec::new(), trust_all: true }
+            }
+        }
+    }
+
+    /// Check if a direct connection IP is a trusted proxy.
+    pub fn is_trusted(&self, ip: IpAddr) -> bool {
+        if self.trust_all {
+            return true;
+        }
+        self.networks.iter().any(|net| net.contains(&ip))
+    }
+}
+
+impl Default for TrustedProxyFilter {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 /// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -105,6 +186,10 @@ pub struct AppState {
     pub shutdown_signal: Option<ShutdownSignal>,
     /// Retry configuration
     pub retry_config: RetryConfig,
+    /// Streaming configuration for large request bodies
+    pub streaming_config: StreamingConfig,
+    /// Trusted proxy filter for X-Forwarded-For handling
+    pub trusted_proxies: Arc<TrustedProxyFilter>,
 }
 
 impl AppState {
@@ -126,7 +211,21 @@ impl AppState {
             circuit_breakers: Arc::new(CircuitBreakerManager::new(CircuitBreakerConfig::default())),
             shutdown_signal: None,
             retry_config: RetryConfig::default(),
+            streaming_config: StreamingConfig::default(),
+            trusted_proxies: Arc::new(TrustedProxyFilter::default()),
         }
+    }
+
+    /// Set the streaming configuration.
+    pub fn with_streaming_config(mut self, config: StreamingConfig) -> Self {
+        self.streaming_config = config;
+        self
+    }
+
+    /// Set the trusted proxy filter.
+    pub fn with_trusted_proxies(mut self, filter: TrustedProxyFilter) -> Self {
+        self.trusted_proxies = Arc::new(filter);
+        self
     }
 
     /// Set the cluster coordinator for cross-server routing.
@@ -331,11 +430,12 @@ async fn proxy_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
-    // Generate request ID for tracing
-    let request_id = Uuid::new_v4().to_string();
+    // Extract or create trace context from incoming request
+    let trace_ctx = TraceContext::from_headers(request.headers());
+    let request_id = trace_ctx.request_id.clone();
     
-    let response = proxy_handler_inner(state, host, addr, request, &request_id).await;
-    add_request_id(response, &request_id)
+    let response = proxy_handler_inner(state, host, addr, request, &request_id, &trace_ctx).await;
+    add_trace_headers(response, &trace_ctx)
 }
 
 async fn proxy_handler_inner(
@@ -344,13 +444,17 @@ async fn proxy_handler_inner(
     addr: SocketAddr,
     request: Request<Body>,
     request_id: &str,
+    trace_ctx: &TraceContext,
 ) -> Response<Body> {
     let start_time = Instant::now();
-    let client_ip = extract_real_client_ip(&request, addr.ip());
+    let client_ip = extract_real_client_ip(&request, addr.ip(), &state.trusted_proxies);
     
-    // Add request ID to tracing context
+    // Add request ID and trace context to tracing span
     let _span = tracing::info_span!("proxy_request", 
         request_id = %request_id,
+        trace_id = %trace_ctx.trace_id,
+        span_id = %trace_ctx.span_id,
+        parent_span_id = %trace_ctx.parent_span_id,
         method = %request.method(),
         path = %request.uri().path()
     );
@@ -436,8 +540,8 @@ async fn proxy_handler_inner(
                         }
                     };
 
-                    // Forward to peer
-                    match route_to_peer(&peer_addr, &method, &path, &headers, &body_bytes).await {
+                    // Forward to peer using pooled connection
+                    match route_to_peer_pooled(&peer_addr, &method, &path, &headers, &body_bytes).await {
                         Ok((status, resp_headers, resp_body)) => {
                             let elapsed = start_time.elapsed();
                             metrics::record_request(&subdomain, status, elapsed.as_millis() as f64, body_bytes.len() as u64, resp_body.len() as u64);
@@ -535,126 +639,233 @@ async fn proxy_handler_inner(
     let path = request.uri().path().to_string();
     let body_limit = state.body_limiter.get_limit(&path);
 
-    // Convert the request to our protocol format
-    let http_request = match convert_request(request, body_limit).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to convert request: {}", e);
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                "request_error",
-                &format!("Failed to process request: {}", e),
-                false,
-            );
-        }
-    };
+    // Check content-length for streaming decision
+    let content_length = request
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    
+    let should_stream = !is_websocket && content_length > state.streaming_config.threshold;
 
-    // === Request Validation ===
-    let headers_vec: Vec<(String, String)> = http_request
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let validation_result = state.validator.validate(
-        &headers_vec,
-        Some(&http_request.body),
-        Some(http_request.body.len()),
-    );
-    if !validation_result.is_valid() {
-        if let crate::validation::ValidationResult::Invalid(reason) = validation_result {
-            warn!("Request validation failed: {}", reason);
-            metrics::record_validation_failure(&subdomain, &reason);
-            return json_error_response(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                &reason,
-                false,
-            );
-        }
-    }
-
-    // Record request body size
-    let request_body_size = http_request.body.len();
-    metrics::record_request_body_size(request_body_size);
-
-    // Send request through tunnel and wait for response
-    let request_id = RequestId::new();
-    let msg = if is_websocket {
-        debug!("WebSocket upgrade detected for tunnel {}", tunnel.id);
-        Message::websocket_upgrade(request_id, http_request)
-    } else {
-        Message::http_request(request_id, http_request)
-    };
-
-    match tunnel.send_request(msg).await {
-        Ok(response_msg) => {
-            let response = convert_response(response_msg.clone());
-            let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-
-            // Extract response details for metrics
-            let status = response.status().as_u16();
-            let response_body_size = match &response_msg.payload {
-                Payload::HttpResponse(r) => r.body.len(),
-                _ => 0,
-            };
-
-            // Record circuit breaker success for non-error responses
-            if status < 500 {
-                state.circuit_breakers.record_success(&tunnel_id_str);
-            } else {
-                // 5xx responses count as failures for circuit breaker
+    // Use streaming for large request bodies
+    if should_stream {
+        debug!(
+            "Using streaming for large request ({} bytes) to tunnel {}",
+            content_length, tunnel.id
+        );
+        
+        let streaming_result = send_request_streaming(
+            &tunnel,
+            request,
+            state.streaming_config.threshold,
+            state.streaming_config.chunk_size,
+        ).await;
+        
+        match streaming_result {
+            Ok((response_msg, total_bytes)) => {
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                metrics::record_request_body_size(total_bytes);
+                
+                let response = convert_response(response_msg.clone());
+                let status = response.status().as_u16();
+                let response_body_size = match &response_msg.payload {
+                    Payload::HttpResponse(r) => r.body.len(),
+                    _ => 0,
+                };
+                
+                // Update circuit breaker
+                if status < 500 {
+                    state.circuit_breakers.record_success(&tunnel_id_str);
+                } else {
+                    state.circuit_breakers.record_failure(&tunnel_id_str);
+                }
+                
+                metrics::record_request(
+                    &tunnel_id_str,
+                    status,
+                    duration_ms,
+                    total_bytes as u64,
+                    response_body_size as u64,
+                );
+                metrics::record_response_body_size(response_body_size);
+                
+                response
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                error!("Streaming request failed: {}", e);
+                
                 state.circuit_breakers.record_failure(&tunnel_id_str);
+                
+                if e.to_string().contains("timeout") {
+                    metrics::record_request_timeout(&tunnel_id_str);
+                } else {
+                    metrics::record_upstream_error(&tunnel_id_str, "streaming_error");
+                }
+                metrics::record_request(&tunnel_id_str, 502, duration_ms, content_length as u64, 0);
+                
+                json_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "streaming_error",
+                    &format!("Failed to stream request: {}", e),
+                    true,
+                )
             }
-
-            metrics::record_request(
-                &tunnel_id_str,
-                status,
-                duration_ms,
-                request_body_size as u64,
-                response_body_size as u64,
-            );
-            metrics::record_response_body_size(response_body_size);
-
-            response
         }
-        Err(e) => {
-            let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-            error!("Tunnel request failed: {}", e);
-
-            // Record circuit breaker failure
-            state.circuit_breakers.record_failure(&tunnel_id_str);
-
-            // Check if it's a timeout
-            if e.to_string().contains("timeout") {
-                metrics::record_request_timeout(&tunnel_id_str);
-            } else {
-                metrics::record_upstream_error(&tunnel_id_str, "tunnel_error");
+    } else {
+        // Standard buffered request path
+        // Convert the request to our protocol format and inject trace context
+        let http_request = match convert_request(request, body_limit, Some(trace_ctx)).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to convert request: {}", e);
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "request_error",
+                    &format!("Failed to process request: {}", e),
+                    false,
+                );
             }
-            metrics::record_request(
-                &tunnel_id_str,
-                502,
-                duration_ms,
-                request_body_size as u64,
-                0,
-            );
+        };
 
-            json_error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "Failed to reach upstream service",
-                true,
+        // === Request Validation ===
+        let headers_vec: Vec<(String, String)> = http_request
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let validation_result = state.validator.validate(
+            &headers_vec,
+            Some(&http_request.body),
+            Some(http_request.body.len()),
+        );
+        if !validation_result.is_valid() {
+            if let crate::validation::ValidationResult::Invalid(reason) = validation_result {
+                warn!("Request validation failed: {}", reason);
+                metrics::record_validation_failure(&subdomain, &reason);
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "validation_failed",
+                    &reason,
+                    false,
+                );
+            }
+        }
+
+        // Record request body size
+        let request_body_size = http_request.body.len();
+        metrics::record_request_body_size(request_body_size);
+
+        // Send request through tunnel and wait for response
+        let request_id = RequestId::new();
+        let msg = if is_websocket {
+            debug!("WebSocket upgrade detected for tunnel {}", tunnel.id);
+            Message::websocket_upgrade(request_id, http_request)
+        } else {
+            Message::http_request(request_id, http_request)
+        };
+
+        // Use retry logic for non-WebSocket requests
+        let result = if is_websocket {
+            // WebSocket upgrades should not be retried
+            tunnel.send_request(msg).await
+        } else {
+            // Use retry logic with circuit breaker integration
+            send_request_with_retry(
+                &tunnel,
+                msg,
+                &state.retry_config,
+                &state.circuit_breakers,
+                &tunnel_id_str,
             )
+            .await
+        };
+
+        match result {
+            Ok(response_msg) => {
+                let response = convert_response(response_msg.clone());
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+
+                // Extract response details for metrics
+                let status = response.status().as_u16();
+                let response_body_size = match &response_msg.payload {
+                    Payload::HttpResponse(r) => r.body.len(),
+                    _ => 0,
+                };
+
+                // Circuit breaker updates are now handled in send_request_with_retry
+                // Only update here for WebSocket upgrades
+                if is_websocket {
+                    if status < 500 {
+                        state.circuit_breakers.record_success(&tunnel_id_str);
+                    } else {
+                        state.circuit_breakers.record_failure(&tunnel_id_str);
+                    }
+                }
+
+                metrics::record_request(
+                    &tunnel_id_str,
+                    status,
+                    duration_ms,
+                    request_body_size as u64,
+                    response_body_size as u64,
+                );
+                metrics::record_response_body_size(response_body_size);
+
+                response
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                error!("Tunnel request failed: {}", e);
+
+                // Check if it's a timeout
+                if e.to_string().contains("timeout") {
+                    metrics::record_request_timeout(&tunnel_id_str);
+                } else {
+                    metrics::record_upstream_error(&tunnel_id_str, "tunnel_error");
+                }
+                metrics::record_request(
+                    &tunnel_id_str,
+                    502,
+                    duration_ms,
+                    request_body_size as u64,
+                    0,
+                );
+
+                json_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Failed to reach upstream service",
+                    true,
+                )
+            }
         }
     }
 }
 
 /// Extract real client IP, considering X-Forwarded-For and X-Real-IP headers.
-fn extract_real_client_ip(request: &Request<Body>, fallback: IpAddr) -> IpAddr {
+/// Only trusts these headers when the direct connection is from a trusted proxy.
+fn extract_real_client_ip(
+    request: &Request<Body>,
+    direct_ip: IpAddr,
+    trusted_proxies: &TrustedProxyFilter,
+) -> IpAddr {
+    // Only trust forwarded headers if connection is from a trusted proxy
+    if !trusted_proxies.is_trusted(direct_ip) {
+        debug!("Direct IP {} is not a trusted proxy, ignoring forwarded headers", direct_ip);
+        return direct_ip;
+    }
+
     // Check X-Forwarded-For header first
     if let Some(forwarded_for) = request.headers().get("x-forwarded-for") {
         if let Ok(value) = forwarded_for.to_str() {
+            // X-Forwarded-For may contain multiple IPs: "client, proxy1, proxy2"
+            // The first one is the original client
             if let Some(ip_str) = value.split(',').next() {
                 if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                    debug!("Using client IP {} from X-Forwarded-For", ip);
                     return ip;
                 }
             }
@@ -665,18 +876,20 @@ fn extract_real_client_ip(request: &Request<Body>, fallback: IpAddr) -> IpAddr {
     if let Some(real_ip) = request.headers().get("x-real-ip") {
         if let Ok(value) = real_ip.to_str() {
             if let Ok(ip) = value.parse::<IpAddr>() {
+                debug!("Using client IP {} from X-Real-IP", ip);
                 return ip;
             }
         }
     }
 
-    fallback
+    direct_ip
 }
 
-/// WebSocket upgrade handler - this is called when we need to do frame-level relay
-/// TODO(Phase 4): Wire this up for full WebSocket frame relay
-#[allow(dead_code)]
-async fn websocket_upgrade_handler(
+/// WebSocket upgrade handler for frame-level relay.
+/// This provides more fine-grained control over WebSocket connections,
+/// relaying individual frames through the tunnel rather than passing the entire connection.
+/// Use this when you need to inspect or modify WebSocket frames.
+pub async fn websocket_upgrade_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Host(host): Host,
@@ -738,8 +951,7 @@ async fn websocket_upgrade_handler(
 }
 
 /// Handle bidirectional WebSocket frame relay.
-/// TODO(Phase 4): This is used by websocket_upgrade_handler for frame-level relay
-#[allow(dead_code)]
+/// Forwards WebSocket frames between the public client and the tunnel client.
 async fn handle_websocket_relay(
     socket: WebSocket,
     tunnel: Arc<crate::tunnel::TunnelConnection>,
@@ -846,7 +1058,11 @@ fn extract_subdomain(host: &str, domain: &str) -> Option<String> {
     None
 }
 
-async fn convert_request(request: Request<Body>, body_size_limit: usize) -> Result<HttpRequestData> {
+async fn convert_request(
+    request: Request<Body>,
+    body_size_limit: usize,
+    trace_ctx: Option<&TraceContext>,
+) -> Result<HttpRequestData> {
     let method = match request.method().as_str() {
         "GET" => HttpMethod::Get,
         "POST" => HttpMethod::Post,
@@ -871,13 +1087,19 @@ async fn convert_request(request: Request<Body>, body_size_limit: usize) -> Resu
 
     let uri = request.uri().to_string();
 
-    let headers: Vec<(String, String)> = request
+    // Collect existing headers
+    let mut headers: Vec<(String, String)> = request
         .headers()
         .iter()
         .filter_map(|(k, v)| {
             v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
         })
         .collect();
+
+    // Inject trace context headers for propagation
+    if let Some(ctx) = trace_ctx {
+        ctx.inject_headers(&mut headers);
+    }
 
     let body = axum::body::to_bytes(request.into_body(), body_size_limit)
         .await
@@ -894,15 +1116,15 @@ async fn convert_request(request: Request<Body>, body_size_limit: usize) -> Resu
 
 /// Streaming request handler for large bodies.
 /// Sends the request headers first, then streams body chunks through the tunnel.
-/// Returns the request ID for tracking the response.
-#[allow(dead_code)]
+/// Waits for and returns the response message.
 async fn send_request_streaming(
     tunnel: &Arc<crate::tunnel::TunnelConnection>,
     request: Request<Body>,
     streaming_threshold: usize,
     chunk_size: usize,
-) -> Result<(RequestId, usize)> {
+) -> Result<(Message, usize)> {
     use futures_util::stream::StreamExt;
+    use tokio::sync::oneshot;
 
     let (parts, body) = request.into_parts();
 
@@ -946,6 +1168,13 @@ async fn send_request_streaming(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
+    // Register pending request for response handling
+    let (response_tx, response_rx) = oneshot::channel();
+    tunnel.pending_requests.insert(
+        request_id,
+        crate::tunnel::PendingRequest { response_tx },
+    );
+
     // If body is small enough, don't use streaming
     if content_length < streaming_threshold {
         let body_bytes = axum::body::to_bytes(body, streaming_threshold)
@@ -961,12 +1190,20 @@ async fn send_request_streaming(
         };
 
         let msg = Message::http_request(request_id, http_request);
-        tunnel.send_message(msg).await?;
+        tunnel.tx.send(msg).await?;
 
-        return Ok((request_id, body_bytes.len()));
+        // Wait for response with timeout
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(tunnel.request_timeout),
+            response_rx,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Request timeout ({}s)", tunnel.request_timeout))??;
+
+        return Ok((response, body_bytes.len()));
     }
 
-    // For large bodies, send the request with empty body first
+    // For large bodies, send the request with empty body first (indicating streaming)
     let http_request = HttpRequestData {
         method,
         uri,
@@ -976,7 +1213,7 @@ async fn send_request_streaming(
     };
 
     let msg = Message::http_request(request_id, http_request);
-    tunnel.send_message(msg).await?;
+    tunnel.tx.send(msg).await?;
 
     // Stream the body in chunks
     let mut body_stream = body.into_data_stream();
@@ -998,7 +1235,7 @@ async fn send_request_streaming(
                 data: to_send,
             };
             let msg = Message::stream_chunk(request_id, stream_chunk);
-            tunnel.send_message(msg).await?;
+            tunnel.tx.send(msg).await?;
             
             metrics::record_stream_chunk(&tunnel.id.to_string(), chunk_size);
             chunk_index += 1;
@@ -1012,18 +1249,26 @@ async fn send_request_streaming(
         data: buffer,
     };
     let msg = Message::stream_chunk(request_id, stream_chunk);
-    tunnel.send_message(msg).await?;
+    tunnel.tx.send(msg).await?;
 
     // Send stream end marker
     let msg = Message::stream_end(request_id);
-    tunnel.send_message(msg).await?;
+    tunnel.tx.send(msg).await?;
 
     debug!(
         "Streamed {} bytes in {} chunks for request {}",
         total_bytes, chunk_index + 1, request_id
     );
 
-    Ok((request_id, total_bytes))
+    // Wait for response with timeout
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(tunnel.request_timeout),
+        response_rx,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Request timeout ({}s)", tunnel.request_timeout))??;
+
+    Ok((response, total_bytes))
 }
 
 fn convert_response(msg: Message) -> Response<Body> {
@@ -1085,7 +1330,6 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
 
 /// Send a request through the tunnel with retry logic.
 /// Retries on connection failures and configured status codes.
-#[allow(dead_code)]
 async fn send_request_with_retry(
     tunnel: &Arc<crate::tunnel::TunnelConnection>,
     msg: Message,

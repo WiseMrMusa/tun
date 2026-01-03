@@ -169,6 +169,12 @@ pub struct ServerConfig {
     /// Internal address for cluster communication
     #[arg(long, env = "TUN_CLUSTER_INTERNAL_ADDR")]
     pub cluster_internal_addr: Option<String>,
+
+    /// Trusted proxy IP addresses or CIDR ranges (comma-separated).
+    /// X-Forwarded-For and X-Real-IP headers are only trusted from these IPs.
+    /// If not set, headers are always trusted (insecure, but compatible).
+    #[arg(long, env = "TUN_TRUSTED_PROXIES", value_delimiter = ',')]
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 impl ServerConfig {
