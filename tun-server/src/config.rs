@@ -96,6 +96,10 @@ pub struct ServerConfig {
     #[arg(long, env = "TUN_DATABASE_URL")]
     pub database_url: Option<String>,
 
+    /// Maximum database connections in the pool
+    #[arg(long, env = "TUN_DB_MAX_CONNECTIONS", default_value = "10")]
+    pub db_max_connections: u32,
+
     /// Server ID for horizontal scaling (auto-generated if not provided)
     #[arg(long, env = "TUN_SERVER_ID")]
     pub server_id: Option<String>,

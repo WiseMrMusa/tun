@@ -77,8 +77,9 @@ async fn main() -> Result<()> {
 
     // Initialize database if configured
     let db = if let Some(ref database_url) = config.database_url {
-        info!("Initializing database connection...");
-        let db_config = DbConfig::new(database_url.clone(), config.get_server_id());
+        info!("Initializing database connection (max_connections: {})...", config.db_max_connections);
+        let db_config = DbConfig::new(database_url.clone(), config.get_server_id())
+            .with_max_connections(config.db_max_connections);
         match TunnelDb::new(&db_config).await {
             Ok(db) => {
                 // Run migrations
@@ -329,11 +330,9 @@ async fn main() -> Result<()> {
             config.api_key.clone(),
         );
 
-        if config.api_key.is_some() {
-            info!("API authentication enabled (admin endpoints require API key)");
-        } else {
-            warn!("API authentication disabled - admin endpoints are unprotected!");
-        }
+        // Note: The api.rs create_api_router function now handles admin endpoint
+        // enablement based on whether api_key is configured. It logs appropriate
+        // warnings when admin endpoints are disabled.
 
         let api_router = if config.enable_dashboard {
             info!("Dashboard enabled at http://0.0.0.0:{}/", api_port);
